@@ -6,7 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     "DEFAULT_YOUTUBE_CHANNEL": "",
-    "PUBLIC_R2_BASE_URL": "https://chat.bluemoon.works",
+    "PUBLIC_R2_BASE_URL": "https://chat.blmf.bluemoon.works",
     "R2_CURRENT_OBJECT_KEY": "comments.json",
     "R2_STATUS_OBJECT_KEY": "status.json",
     "DISCOVERY_INTERVAL_SECONDS": "300",

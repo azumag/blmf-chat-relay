@@ -27,7 +27,7 @@ flowchart LR
   DO --> Search[YouTube Data API\nチャンネル解決・ライブ検出]
   DO --> Chat[YouTube Live Chat API\nコメント取得]
   DO --> R2[(Cloudflare R2)]
-  R2 --> Domain[chat.bluemoon.works]
+  R2 --> Domain[chat.blmf.bluemoon.works]
 ```
 
 Durable Object は1つだけ使用し、リレー状態・ページトークン・取得済みコメントを SQLite に保持します。Alarm が次回の配信検索またはコメント取得を起動します。
@@ -36,7 +36,7 @@ Durable Object は1つだけ使用し、リレー状態・ページトークン�
 
 ### 最新コメント
 
-`https://chat.bluemoon.works/comments.json`
+`https://chat.blmf.bluemoon.works/comments.json`
 
 ```json
 [
@@ -52,13 +52,13 @@ Durable Object は1つだけ使用し、リレー状態・ページトークン�
 
 ### 状態
 
-`https://chat.bluemoon.works/status.json`
+`https://chat.blmf.bluemoon.works/status.json`
 
 稼働状態、チャンネル、検出した配信、コメント数、次回処理時刻、直近エラー、各 JSON の URL を含みます。
 
 ### 配信別アーカイブ
 
-`https://chat.bluemoon.works/streams/{videoId}/comments.json`
+`https://chat.blmf.bluemoon.works/streams/{videoId}/comments.json`
 
 配信中も最新スナップショットへ更新し、配信終了・手動停止時に最終反映します。
 
@@ -149,7 +149,7 @@ Cloudflare ダッシュボードで `bluemoon.works` の Zone ID を確認し、
 
 ```bash
 npx wrangler r2 bucket domain add blmf-chat-relay \
-  --domain chat.bluemoon.works \
+  --domain chat.blmf.bluemoon.works \
   --zone-id YOUR_ZONE_ID \
   --min-tls 1.2
 ```
@@ -158,7 +158,7 @@ npx wrangler r2 bucket domain add blmf-chat-relay \
 
 ```bash
 npx wrangler r2 bucket domain get blmf-chat-relay \
-  --domain chat.bluemoon.works
+  --domain chat.blmf.bluemoon.works
 ```
 
 別のサブドメインを使う場合は、`wrangler.jsonc` の `PUBLIC_R2_BASE_URL` も同じ URL に変更してください。
@@ -239,7 +239,7 @@ http://localhost:8787/admin
 | 変数 | 既定値 | 説明 |
 |---|---:|---|
 | `DEFAULT_YOUTUBE_CHANNEL` | 空 | 管理画面で省略した場合のチャンネル |
-| `PUBLIC_R2_BASE_URL` | `https://chat.bluemoon.works` | 公開R2のベースURL |
+| `PUBLIC_R2_BASE_URL` | `https://chat.blmf.bluemoon.works` | 公開R2のベースURL |
 | `R2_CURRENT_OBJECT_KEY` | `comments.json` | 最新コメントのオブジェクトキー |
 | `R2_STATUS_OBJECT_KEY` | `status.json` | 状態JSONのオブジェクトキー |
 | `DISCOVERY_INTERVAL_SECONDS` | `300` | 配信未検出時の再検索間隔。30〜3600秒に制限 |
