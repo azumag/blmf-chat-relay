@@ -1,0 +1,15 @@
+{
+  "rules": [
+    {
+      "allowed": {
+        "origins": [
+          "https://bluemoon.works",
+          "https://www.bluemoon.works"
+        ],
+        "methods": ["GET", "HEAD"]
+      },
+      "exposeHeaders": ["ETag", "Content-Type", "Cache-Control"],
+      "maxAgeSeconds": 3600
+    }
+  ]
+}
