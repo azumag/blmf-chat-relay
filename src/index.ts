@@ -66,6 +66,35 @@ export default {
         return jsonResponse(await relay.start(channel));
       }
 
+      if (request.method === "POST" && url.pathname === "/api/e2e/start") {
+        const unauthorized = await requireAuthorization(request, env);
+        if (unauthorized !== null) {
+          return unauthorized;
+        }
+
+        const body = await readJsonObject(request);
+        const requestedChannel =
+          typeof body.channel === "string" ? body.channel.trim() : "";
+        const channel =
+          requestedChannel === ""
+            ? env.DEFAULT_YOUTUBE_CHANNEL.trim()
+            : requestedChannel;
+        if (channel === "") {
+          return errorResponse(
+            "channel を指定するか、DEFAULT_YOUTUBE_CHANNEL を設定してください。",
+            400,
+          );
+        }
+
+        const videoId =
+          typeof body.videoId === "string" ? body.videoId.trim() : "";
+        if (videoId === "") {
+          return errorResponse("videoId を指定してください。", 400);
+        }
+
+        return jsonResponse(await relay.startE2E(channel, videoId));
+      }
+
       if (request.method === "POST" && url.pathname === "/api/stop") {
         const unauthorized = await requireAuthorization(request, env);
         if (unauthorized !== null) {
@@ -204,7 +233,10 @@ class ClientInputError extends Error {
 function isClientError(error: unknown): boolean {
   return (
     error instanceof ClientInputError ||
-    (error instanceof Error && /チャンネル|ハンドル|URL/.test(error.message))
+    (error instanceof Error &&
+      /チャンネル|ハンドル|URL|動画ID|動画|ライブ配信|ライブチャット/.test(
+        error.message,
+      ))
   );
 }
 

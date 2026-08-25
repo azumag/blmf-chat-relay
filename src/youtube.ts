@@ -6,6 +6,7 @@ import type {
 
 const YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3";
 const CHANNEL_ID_PATTERN = /^UC[0-9A-Za-z_-]{22}$/;
+const VIDEO_ID_PATTERN = /^[0-9A-Za-z_-]{11}$/;
 
 export type Fetcher = (
   input: RequestInfo | URL,
@@ -55,6 +56,7 @@ interface VideoListResponse {
     id?: string;
     snippet?: {
       title?: string;
+      channelId?: string;
     };
     liveStreamingDetails?: {
       actualStartTime?: string;
@@ -320,6 +322,76 @@ export async function findActiveBroadcast(
     liveChatId,
     actualStartTime:
       normalizeDateTime(active.liveStreamingDetails?.actualStartTime) ?? null,
+  };
+}
+
+export function parseVideoId(input: string): string {
+  const videoId = input.trim();
+  if (!VIDEO_ID_PATTERN.test(videoId)) {
+    throw new Error("YouTube 動画IDは11文字のIDで指定してください。");
+  }
+  return videoId;
+}
+
+export async function findBroadcastByVideoId(
+  apiKey: string,
+  input: string,
+  expectedChannelId: string,
+  fetcher: Fetcher = fetch,
+): Promise<ActiveBroadcast> {
+  const videoId = parseVideoId(input);
+  const videos = await youtubeRequest<VideoListResponse>(
+    "/videos",
+    new URLSearchParams({
+      part: "snippet,liveStreamingDetails",
+      id: videoId,
+      key: apiKey,
+    }),
+    fetcher,
+  );
+  const video = videos.items?.[0];
+
+  if (video?.id !== videoId) {
+    throw new YouTubeApiError(
+      "指定された YouTube 動画が見つかりませんでした。",
+      404,
+      ["videoNotFound"],
+    );
+  }
+
+  if (video.snippet?.channelId !== expectedChannelId) {
+    throw new YouTubeApiError(
+      "指定された動画は対象チャンネルの配信ではありません。",
+      400,
+      ["channelMismatch"],
+    );
+  }
+
+  const details = video.liveStreamingDetails;
+  if (
+    details?.actualStartTime === undefined ||
+    details.actualEndTime !== undefined
+  ) {
+    throw new YouTubeApiError(
+      "指定された動画は現在ライブ配信中ではありません。",
+      400,
+      ["broadcastNotLive"],
+    );
+  }
+
+  if (details.activeLiveChatId === undefined) {
+    throw new YouTubeApiError(
+      "指定されたライブ配信ではライブチャットが利用できません。",
+      403,
+      ["liveChatDisabled"],
+    );
+  }
+
+  return {
+    videoId,
+    title: video.snippet?.title ?? videoId,
+    liveChatId: details.activeLiveChatId,
+    actualStartTime: normalizeDateTime(details.actualStartTime),
   };
 }
 

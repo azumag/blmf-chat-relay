@@ -47,6 +47,16 @@ export const ADMIN_HTML = `<!doctype html>
         <button id="startButton" class="button button-primary" type="button">開始・再検出</button>
         <button id="stopButton" class="button button-danger" type="button">停止</button>
       </div>
+
+      <div class="e2e-controls">
+        <p class="section-kicker">UNLISTED E2E</p>
+        <label class="field">
+          <span>限定公開ライブの動画ID</span>
+          <input id="videoIdInput" type="text" placeholder="YouTubeの11文字の動画ID" maxlength="11" autocomplete="off">
+          <small>限定公開E2E専用です。上のチャンネルとの一致と、ライブ中・チャット有効であることを確認して開始します。</small>
+        </label>
+        <button id="e2eStartButton" class="button button-e2e" type="button">限定公開E2E開始</button>
+      </div>
       <p id="actionMessage" class="action-message" role="status" aria-live="polite"></p>
     </section>
 
@@ -180,6 +190,8 @@ h2 { font-size: 24px; }
 .remember { display: flex; align-items: center; gap: 9px; margin-top: 14px; color: #929cab; font-size: 13px; }
 .remember input { accent-color: #6c8cff; }
 .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+.e2e-controls { margin-top: 24px; padding-top: 22px; border-top: 1px solid #252c39; }
+.e2e-controls .button { margin-top: 14px; }
 .button {
   border: 0;
   border-radius: 11px;
@@ -192,6 +204,7 @@ h2 { font-size: 24px; }
 .button:hover { filter: brightness(1.08); transform: translateY(-1px); }
 .button:disabled { cursor: wait; opacity: .5; transform: none; }
 .button-primary { background: #5679ff; }
+.button-e2e { background: #287c68; }
 .button-danger { background: #823342; }
 .button-ghost { border: 1px solid #30394a; background: #151a26; color: #c1c9d7; }
 .action-message { min-height: 1.4em; margin: 14px 0 0; color: #9fb9ff; font-size: 14px; }
@@ -243,6 +256,8 @@ export const ADMIN_SCRIPT = `(() => {
   const tokenInput = byId("tokenInput");
   const rememberInput = byId("rememberInput");
   const startButton = byId("startButton");
+  const e2eStartButton = byId("e2eStartButton");
+  const videoIdInput = byId("videoIdInput");
   const stopButton = byId("stopButton");
   const refreshButton = byId("refreshButton");
   const actionMessage = byId("actionMessage");
@@ -350,7 +365,7 @@ export const ADMIN_SCRIPT = `(() => {
     }
   }
 
-  async function sendAction(path, body) {
+  async function sendAction(path, body, successMessage) {
     saveCredentials();
     const token = tokenInput.value.trim();
     if (!token) {
@@ -359,6 +374,7 @@ export const ADMIN_SCRIPT = `(() => {
     }
 
     startButton.disabled = true;
+    e2eStartButton.disabled = true;
     stopButton.disabled = true;
     actionMessage.textContent = "処理中…";
     try {
@@ -371,21 +387,36 @@ export const ADMIN_SCRIPT = `(() => {
         body: JSON.stringify(body || {})
       }));
       render(status);
-      actionMessage.textContent = path.endsWith("start")
-        ? "開始しました。配信の自動検出を行います。"
-        : "停止しました。";
+      actionMessage.textContent = successMessage;
     } catch (error) {
       actionMessage.textContent = "操作に失敗しました: " + error.message;
     } finally {
       startButton.disabled = false;
+      e2eStartButton.disabled = false;
       stopButton.disabled = false;
     }
   }
 
   startButton.addEventListener("click", () => {
-    sendAction("/api/start", { channel: channelInput.value.trim() });
+    sendAction(
+      "/api/start",
+      { channel: channelInput.value.trim() },
+      "開始しました。配信の自動検出を行います。"
+    );
   });
-  stopButton.addEventListener("click", () => sendAction("/api/stop", {}));
+  e2eStartButton.addEventListener("click", () => {
+    sendAction(
+      "/api/e2e/start",
+      {
+        channel: channelInput.value.trim(),
+        videoId: videoIdInput.value.trim()
+      },
+      "限定公開E2Eを開始しました。指定したライブのコメントを取得します。"
+    );
+  });
+  stopButton.addEventListener("click", () => {
+    sendAction("/api/stop", {}, "停止しました。");
+  });
   refreshButton.addEventListener("click", () => refreshStatus(true));
   rememberInput.addEventListener("change", saveCredentials);
   tokenInput.addEventListener("change", saveCredentials);

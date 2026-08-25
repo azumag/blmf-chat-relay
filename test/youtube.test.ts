@@ -3,7 +3,9 @@ import { isAuthorized } from "../src/auth";
 import {
   classifyLiveChatItem,
   findActiveBroadcast,
+  findBroadcastByVideoId,
   parseChannelReference,
+  parseVideoId,
   resolveChannel,
   YouTubeApiError,
   type Fetcher,
@@ -117,6 +119,92 @@ describe("classifyLiveChatItem", () => {
 });
 
 describe("YouTube API helpers", () => {
+  it("E2E用の動画IDは11文字だけを受け付ける", () => {
+    expect(parseVideoId("dQw4w9WgXcQ")).toBe("dQw4w9WgXcQ");
+    expect(() => parseVideoId("https://youtu.be/dQw4w9WgXcQ")).toThrow(
+      /11文字/,
+    );
+  });
+
+  it("既知の動画IDから限定公開ライブを直接解決する", async () => {
+    const fetcher: Fetcher = async (input) => {
+      const url = new URL(input.toString());
+      expect(url.pathname).toMatch(/\/videos$/);
+      expect(url.searchParams.get("id")).toBe("dQw4w9WgXcQ");
+      return Response.json({
+        items: [{
+          id: "dQw4w9WgXcQ",
+          snippet: {
+            title: "限定公開テスト",
+            channelId: "UC1234567890123456789012",
+          },
+          liveStreamingDetails: {
+            actualStartTime: "2026-08-26T01:00:00Z",
+            activeLiveChatId: "chat-unlisted",
+          },
+        }],
+      });
+    };
+
+    await expect(
+      findBroadcastByVideoId(
+        "api-key",
+        "dQw4w9WgXcQ",
+        "UC1234567890123456789012",
+        fetcher,
+      ),
+    ).resolves.toEqual({
+      videoId: "dQw4w9WgXcQ",
+      title: "限定公開テスト",
+      liveChatId: "chat-unlisted",
+      actualStartTime: "2026-08-26T01:00:00.000Z",
+    });
+  });
+
+  it("E2E動画が別チャンネルなら拒否する", async () => {
+    const fetcher: Fetcher = async () => Response.json({
+      items: [{
+        id: "dQw4w9WgXcQ",
+        snippet: { title: "別チャンネル", channelId: "UC-other" },
+        liveStreamingDetails: {
+          actualStartTime: "2026-08-26T01:00:00Z",
+          activeLiveChatId: "chat-other",
+        },
+      }],
+    });
+
+    await expect(
+      findBroadcastByVideoId(
+        "api-key",
+        "dQw4w9WgXcQ",
+        "UC1234567890123456789012",
+        fetcher,
+      ),
+    ).rejects.toMatchObject({ reasons: ["channelMismatch"] });
+  });
+
+  it("E2E動画がライブ開始前なら拒否する", async () => {
+    const fetcher: Fetcher = async () => Response.json({
+      items: [{
+        id: "dQw4w9WgXcQ",
+        snippet: {
+          title: "開始前",
+          channelId: "UC1234567890123456789012",
+        },
+        liveStreamingDetails: { activeLiveChatId: "chat-upcoming" },
+      }],
+    });
+
+    await expect(
+      findBroadcastByVideoId(
+        "api-key",
+        "dQw4w9WgXcQ",
+        "UC1234567890123456789012",
+        fetcher,
+      ),
+    ).rejects.toMatchObject({ reasons: ["broadcastNotLive"] });
+  });
+
   it("ハンドルからチャンネルIDを解決する", async () => {
     const fetcher: Fetcher = async (input) => {
       const url = new URL(input.toString());

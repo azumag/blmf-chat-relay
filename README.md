@@ -8,6 +8,7 @@ YouTube チャンネルを指定すると、現在アクティブなライブ配
 
 - `UC...` のチャンネルID、`@handle`、YouTube チャンネルURLからチャンネルを解決
 - 指定チャンネルの現在のライブ配信を自動検出
+- 既知の動画IDを使って限定公開ライブを直接指定するE2E専用経路
 - YouTube が返す `pollingIntervalMillis` を守ってコメントを取得
 - Durable Object と Alarm により、HTTP リクエストがなくても取得を継続
 - R2 の `comments.json` を一定間隔で更新
@@ -188,6 +189,8 @@ https://blmf-chat-relay.<YOUR_SUBDOMAIN>.workers.dev/admin
 
 管理トークンとチャンネルを入力して「開始・再検出」を押します。停止時は「停止」を押します。
 
+限定公開ライブで実配信E2Eを行う場合は、同じ画面の「限定公開ライブの動画ID」に11文字の動画IDを入力し、「限定公開E2E開始」を押します。この経路は通常の自動検出を迂回して動画を直接取得しますが、指定した動画が入力チャンネルに属すること、現在ライブ中であること、ライブチャットが有効であることを開始前に検証します。YouTube上の限定公開設定や外部通知設定は変更しません。
+
 ### API
 
 状態取得は認証不要です。
@@ -207,6 +210,18 @@ curl -X POST \
 ```
 
 `channel` を空にすると `DEFAULT_YOUTUBE_CHANNEL` を使います。
+
+限定公開E2E開始:
+
+```bash
+curl -X POST \
+  https://blmf-chat-relay.<YOUR_SUBDOMAIN>.workers.dev/api/e2e/start \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"@your-channel","videoId":"XXXXXXXXXXX"}'
+```
+
+`videoId` は動画URLではなく11文字のIDを指定します。これは限定公開E2E専用の管理APIで、Bearer認証が必須です。通常運用は `/api/start` のチャンネル自動検出を使用します。
 
 停止:
 

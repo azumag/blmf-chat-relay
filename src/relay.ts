@@ -18,7 +18,10 @@ import {
   type RelayStatus,
 } from "./types";
 import {
+  findBroadcastByVideoId,
   parseChannelReference,
+  parseVideoId,
+  resolveChannel,
   YouTubeApiError,
 } from "./youtube";
 
@@ -40,6 +43,10 @@ export class YouTubeChatRelay extends DurableObject<Env> {
 
   async start(channelRef: string): Promise<RelayStatus> {
     return this.runSerially(() => this.startInternal(channelRef));
+  }
+
+  async startE2E(channelRef: string, videoId: string): Promise<RelayStatus> {
+    return this.runSerially(() => this.startE2EInternal(channelRef, videoId));
   }
 
   async stop(reason = "manual"): Promise<RelayStatus> {
@@ -106,18 +113,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       return this.statusFor(current);
     }
 
-    const oldRunId = current.runId;
-    const oldCommentCount = countComments(this.ctx.storage, oldRunId);
-    let oldArchived = oldCommentCount === 0;
-    if (oldCommentCount > 0) {
-      const flush = await this.safeFlushSnapshot(current, true);
-      current = flush.state;
-      oldArchived = flush.success && current.videoId !== null;
-    }
-
-    if (oldArchived) {
-      deleteRunComments(this.ctx.storage, oldRunId);
-    }
+    await this.archiveAndClearRun(current);
 
     let next = createRunningState(channelRef, now);
     this.saveState(next);
@@ -129,6 +125,86 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       channelRef,
     });
     return this.statusFor(next);
+  }
+
+  private async startE2EInternal(
+    rawChannelRef: string,
+    rawVideoId: string,
+  ): Promise<RelayStatus> {
+    const channelRef = rawChannelRef.trim();
+    parseChannelReference(channelRef);
+    const videoId = parseVideoId(rawVideoId);
+
+    const channel = await resolveChannel(this.env.YOUTUBE_API_KEY, channelRef);
+    const broadcast = await findBroadcastByVideoId(
+      this.env.YOUTUBE_API_KEY,
+      videoId,
+      channel.id,
+    );
+    let current = this.loadState();
+    const now = new Date().toISOString();
+
+    if (current.enabled && current.videoId === videoId) {
+      current = {
+        ...current,
+        phase: "running",
+        channelRef,
+        channelId: channel.id,
+        channelTitle: channel.title,
+        videoTitle: broadcast.title,
+        liveChatId: broadcast.liveChatId,
+        liveStartedAt: broadcast.actualStartTime,
+        lastError: null,
+        consecutiveErrors: 0,
+        updatedAt: now,
+        nextActionAt: now,
+      };
+      this.saveState(current);
+      await this.ctx.storage.setAlarm(Date.now());
+      current = (await this.safeFlushSnapshot(current, true)).state;
+      this.log("relay_e2e_start_refreshed", {
+        runId: current.runId,
+        channelId: channel.id,
+        videoId,
+      });
+      return this.statusFor(current);
+    }
+
+    await this.archiveAndClearRun(current);
+
+    let next: RelayState = {
+      ...createRunningState(channelRef, now),
+      phase: "running",
+      channelId: channel.id,
+      channelTitle: channel.title,
+      videoId: broadcast.videoId,
+      videoTitle: broadcast.title,
+      liveChatId: broadcast.liveChatId,
+      liveStartedAt: broadcast.actualStartTime,
+    };
+    this.saveState(next);
+    await this.ctx.storage.setAlarm(Date.now());
+    next = (await this.safeFlushSnapshot(next, true)).state;
+    this.log("relay_e2e_started", {
+      runId: next.runId,
+      channelId: channel.id,
+      videoId,
+    });
+    return this.statusFor(next);
+  }
+
+  private async archiveAndClearRun(state: RelayState): Promise<void> {
+    const oldRunId = state.runId;
+    const oldCommentCount = countComments(this.ctx.storage, oldRunId);
+    let oldArchived = oldCommentCount === 0;
+    if (oldCommentCount > 0) {
+      const flush = await this.safeFlushSnapshot(state, true);
+      oldArchived = flush.success && flush.state.videoId !== null;
+    }
+
+    if (oldArchived) {
+      deleteRunComments(this.ctx.storage, oldRunId);
+    }
   }
 
   private async stopInternal(reason: string): Promise<RelayStatus> {

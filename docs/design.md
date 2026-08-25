@@ -101,6 +101,18 @@ YouTube のメッセージIDを使って `UPSERT` し、同じページを再取
 
 同時に複数のライブが見つかった場合は、`actualStartTime` が最も新しいものを採用する。
 
+### 限定公開E2E専用経路
+
+`POST /api/e2e/start` は管理トークンに加えてチャンネルと既知の11文字の動画IDを受け取る。`search.list` は使わず、次の順に検証してから同じコメント取得処理へ接続する。
+
+1. 通常経路と同じ方法で指定チャンネルを解決する
+2. `videos.list(id=<videoId>)` で動画を直接取得する
+3. 動画の `snippet.channelId` が解決済みチャンネルIDと一致することを確認する
+4. `actualStartTime` があり、`actualEndTime` がなく、`activeLiveChatId` があることを確認する
+5. Durable Object を `running` で開始し、即時 Alarm から通常の `liveChatMessages.list` へ進む
+
+この経路は限定公開動画を検索結果へ露出させずに実配信E2Eを行うためのもので、通常の `/api/start` の自動検出動作は変更しない。動画の公開範囲やYouTubeの通知設定を変更する機能は持たない。
+
 ## 6. コメント変換
 
 R2へ出す公開形式は次の3項目だけとする。
@@ -183,6 +195,7 @@ Durable Object の Alarm は1個だけ設定できるため、状態に応じて
 
 - `YOUTUBE_API_KEY` と `ADMIN_TOKEN` は Secret
 - 開始・停止は Bearer 認証
+- 限定公開E2E開始も同じ Bearer 認証を必須とし、対象チャンネルとの一致を検証
 - トークン比較は Web Crypto の HMAC verify を使用
 - 状態取得は公開。公開R2に含まれる情報と同等のため
 - 管理画面は厳格な CSP を設定し、外部スクリプトを読み込まない
