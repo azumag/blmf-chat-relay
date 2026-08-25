@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { isAuthorized } from "../src/auth";
 import {
   classifyLiveChatItem,
   findActiveBroadcast,
@@ -7,6 +8,40 @@ import {
   YouTubeApiError,
   type Fetcher,
 } from "../src/youtube";
+
+describe("isAuthorized", () => {
+  it("Secretが未設定ならBearer値にかかわらず拒否する", async () => {
+    const request = new Request("https://example.com/api/start", {
+      headers: { Authorization: "Bearer undefined" },
+    });
+
+    await expect(isAuthorized(request, undefined)).resolves.toBe(false);
+  });
+
+  it("空のSecretを拒否する", async () => {
+    const request = new Request("https://example.com/api/start", {
+      headers: { Authorization: "Bearer token" },
+    });
+
+    await expect(isAuthorized(request, "   ")).resolves.toBe(false);
+  });
+
+  it("一致するBearerトークンだけを許可する", async () => {
+    const authorized = new Request("https://example.com/api/start", {
+      headers: { Authorization: "Bearer expected-token" },
+    });
+    const rejected = new Request("https://example.com/api/start", {
+      headers: { Authorization: "Bearer other-token" },
+    });
+
+    await expect(isAuthorized(authorized, "expected-token")).resolves.toBe(
+      true,
+    );
+    await expect(isAuthorized(rejected, "expected-token")).resolves.toBe(
+      false,
+    );
+  });
+});
 
 describe("parseChannelReference", () => {
   it("チャンネルIDを受け付ける", () => {

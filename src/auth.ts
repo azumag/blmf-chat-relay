@@ -3,10 +3,14 @@ const COMPARISON_KEY = encoder.encode("blmf-chat-relay-admin-token-v1");
 
 export async function isAuthorized(
   request: Request,
-  expectedToken: string,
+  expectedToken: string | undefined,
 ): Promise<boolean> {
   const candidate = readBearerToken(request.headers.get("Authorization"));
-  if (candidate === null || expectedToken === "") {
+  if (
+    candidate === null ||
+    typeof expectedToken !== "string" ||
+    expectedToken.trim() === ""
+  ) {
     return false;
   }
 
