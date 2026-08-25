@@ -11,7 +11,7 @@ export default {
 
     try {
       if (request.method === "GET" && url.pathname === "/") {
-        return Response.redirect(new URL("/admin", url), 302);
+        return Response.redirect(new URL("/admin", url).toString(), 302);
       }
 
       if (request.method === "GET" && url.pathname === "/admin") {

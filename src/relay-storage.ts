@@ -9,10 +9,12 @@ import {
 } from "./youtube";
 
 interface StateRow {
+  [key: string]: SqlStorageValue;
   data: string;
 }
 
 interface CommentRow {
+  [key: string]: SqlStorageValue;
   name: string;
   message: string;
   created_at: string;

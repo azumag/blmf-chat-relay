@@ -50,7 +50,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     return this.runSerially(() => this.currentStatus());
   }
 
-  async alarm(): Promise<void> {
+  override async alarm(): Promise<void> {
     await this.runSerially(async () => {
       const state = this.loadState();
       if (!state.enabled) {
