@@ -11,6 +11,7 @@ import {
   deleteRunComments,
   deleteRunEvents,
   getCommentDelta,
+  getSimpleCommentDelta,
   initializeRelayStorage,
   listComments,
   loadRelayState,
@@ -23,6 +24,7 @@ import {
   type CommentDeltaResponse,
   type RelayState,
   type RelayStatus,
+  type SimpleCommentDeltaResponse,
 } from "./types";
 import {
   findBroadcastByVideoId,
@@ -78,6 +80,15 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         after,
         limit,
       );
+    });
+  }
+
+  async commentsDeltaSimple(
+    limit: number,
+  ): Promise<SimpleCommentDeltaResponse> {
+    return this.runSerially(() => {
+      const state = this.loadState();
+      return getSimpleCommentDelta(this.ctx.storage, state.runId, limit);
     });
   }
 
