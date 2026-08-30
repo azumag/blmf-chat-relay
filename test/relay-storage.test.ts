@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   applyChatItems,
@@ -18,7 +17,13 @@ interface DatabaseLike {
   close(): void;
 }
 
-const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
+const nodeRuntime = globalThis as typeof globalThis & {
+  process: {
+    getBuiltinModule(specifier: string): unknown;
+  };
+};
+
+const { DatabaseSync } = nodeRuntime.process.getBuiltinModule("node:sqlite") as {
   DatabaseSync: new (path: string) => DatabaseLike;
 };
 
