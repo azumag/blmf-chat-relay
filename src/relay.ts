@@ -1,10 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
-import { discoverBroadcast, pollLiveChat, type RelayCycleRuntime } from "./relay-cycle";
+import {
+  discoverBroadcast,
+  pollLiveChat,
+  type RelayCycleRuntime,
+} from "./relay-cycle";
 import { errorMessage, isFatalYouTubeError } from "./relay-errors";
 import { flushRelaySnapshot } from "./relay-r2";
 import {
   countComments,
   deleteRunComments,
+  deleteRunEvents,
+  getCommentDelta,
   initializeRelayStorage,
   listComments,
   loadRelayState,
@@ -14,6 +20,7 @@ import {
   createRunningState,
   readRelayConfig,
   toRelayStatus,
+  type CommentDeltaResponse,
   type RelayState,
   type RelayStatus,
 } from "./types";
@@ -55,6 +62,23 @@ export class YouTubeChatRelay extends DurableObject<Env> {
 
   async status(): Promise<RelayStatus> {
     return this.runSerially(() => this.currentStatus());
+  }
+
+  async commentsDelta(
+    clientStreamId: string | null,
+    after: number | null,
+    limit: number,
+  ): Promise<CommentDeltaResponse> {
+    return this.runSerially(() => {
+      const state = this.loadState();
+      return getCommentDelta(
+        this.ctx.storage,
+        state.runId,
+        clientStreamId,
+        after,
+        limit,
+      );
+    });
   }
 
   override async alarm(): Promise<void> {
@@ -204,6 +228,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
 
     if (oldArchived) {
       deleteRunComments(this.ctx.storage, oldRunId);
+      deleteRunEvents(this.ctx.storage, oldRunId);
     }
   }
 

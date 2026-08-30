@@ -4,6 +4,8 @@ import { isAuthorized } from "./auth";
 export { YouTubeChatRelay } from "./relay";
 
 const RELAY_OBJECT_NAME = "youtube-chat-relay";
+const DELTA_DEFAULT_LIMIT = 50;
+const DELTA_MAX_LIMIT = 200;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -35,6 +37,43 @@ export default {
           service: "blmf-chat-relay",
           timestamp: new Date().toISOString(),
         });
+      }
+
+      if (url.pathname === "/api/comments/delta") {
+        if (request.method === "OPTIONS") {
+          return new Response(null, {
+            status: 204,
+            headers: secureHeaders({
+              ...deltaCorsHeaders(),
+              "Access-Control-Allow-Methods": "GET, OPTIONS",
+              "Access-Control-Allow-Headers": "Accept, Content-Type",
+              "Access-Control-Max-Age": "86400",
+              "Cache-Control": "public, max-age=86400",
+            }),
+          });
+        }
+
+        if (request.method !== "GET") {
+          return new Response(null, {
+            status: 405,
+            headers: secureHeaders({
+              ...deltaCorsHeaders(),
+              Allow: "GET, OPTIONS",
+            }),
+          });
+        }
+
+        const query = readCommentDeltaQuery(url);
+        const relay = env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME);
+        return jsonResponse(
+          await relay.commentsDelta(
+            query.streamId,
+            query.after,
+            query.limit,
+          ),
+          200,
+          deltaCorsHeaders(),
+        );
       }
 
       const relay = env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME);
@@ -129,10 +168,76 @@ export default {
       );
 
       const status = isClientError(error) ? 400 : 500;
-      return errorResponse(errorMessage(error), status);
+      return errorResponse(
+        errorMessage(error),
+        status,
+        url.pathname === "/api/comments/delta" ? deltaCorsHeaders() : {},
+      );
     }
   },
 } satisfies ExportedHandler<Env>;
+
+interface CommentDeltaQuery {
+  streamId: string | null;
+  after: number | null;
+  limit: number;
+}
+
+function readCommentDeltaQuery(url: URL): CommentDeltaQuery {
+  const rawStreamId = url.searchParams.get("streamId");
+  const normalizedStreamId = rawStreamId?.trim() ?? "";
+  if (normalizedStreamId.length > 128) {
+    throw new ClientInputError("streamId が長すぎます。");
+  }
+
+  return {
+    streamId: normalizedStreamId === "" ? null : normalizedStreamId,
+    after: parseOptionalCursor(url.searchParams.get("after")),
+    limit: parseDeltaLimit(url.searchParams.get("limit")),
+  };
+}
+
+function parseOptionalCursor(rawValue: string | null): number | null {
+  const value = rawValue?.trim() ?? "";
+  if (value === "") {
+    return null;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new ClientInputError(
+      "after は0以上の整数カーソルで指定してください。",
+    );
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new ClientInputError("after が扱える範囲を超えています。");
+  }
+  return parsed;
+}
+
+function parseDeltaLimit(rawValue: string | null): number {
+  const value = rawValue?.trim() ?? "";
+  if (value === "") {
+    return DELTA_DEFAULT_LIMIT;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new ClientInputError(
+      `limit は1〜${DELTA_MAX_LIMIT}の整数で指定してください。`,
+    );
+  }
+
+  const parsed = Number(value);
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < 1 ||
+    parsed > DELTA_MAX_LIMIT
+  ) {
+    throw new ClientInputError(
+      `limit は1〜${DELTA_MAX_LIMIT}の整数で指定してください。`,
+    );
+  }
+  return parsed;
+}
 
 async function requireAuthorization(
   request: Request,
@@ -182,18 +287,27 @@ async function readJsonObject(
   return value as Record<string, unknown>;
 }
 
-function jsonResponse(value: unknown, status = 200): Response {
+function jsonResponse(
+  value: unknown,
+  status = 200,
+  additionalHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(value, null, 2), {
     status,
     headers: secureHeaders({
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
+      ...additionalHeaders,
     }),
   });
 }
 
-function errorResponse(message: string, status: number): Response {
-  return jsonResponse({ error: message }, status);
+function errorResponse(
+  message: string,
+  status: number,
+  additionalHeaders: Record<string, string> = {},
+): Response {
+  return jsonResponse({ error: message }, status, additionalHeaders);
 }
 
 function textResponse(
@@ -208,6 +322,12 @@ function textResponse(
       ...additionalHeaders,
     }),
   });
+}
+
+function deltaCorsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "*",
+  };
 }
 
 function secureHeaders(

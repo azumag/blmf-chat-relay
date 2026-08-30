@@ -40,6 +40,25 @@ export interface StoredComment extends ExportedComment {
   authorChannelId: string | null;
 }
 
+export type CommentDeltaEventType = "upsert" | "delete";
+
+export interface CommentDeltaEvent {
+  seq: number;
+  type: CommentDeltaEventType;
+  id: string;
+  name: string | null;
+  message: string | null;
+  created_at: string;
+}
+
+export interface CommentDeltaResponse {
+  streamId: string;
+  events: CommentDeltaEvent[];
+  nextCursor: number;
+  hasMore: boolean;
+  reset: boolean;
+}
+
 export interface RelayStatus {
   enabled: boolean;
   phase: RelayPhase;
