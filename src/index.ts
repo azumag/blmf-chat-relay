@@ -4,8 +4,11 @@ import { isAuthorized } from "./auth";
 export { YouTubeChatRelay } from "./relay";
 
 const RELAY_OBJECT_NAME = "youtube-chat-relay";
+const DELTA_PATH = "/api/comments/delta";
+const SIMPLE_DELTA_PATH = "/api/comments/delta/simple";
 const DELTA_DEFAULT_LIMIT = 50;
 const DELTA_MAX_LIMIT = 200;
+const SIMPLE_DELTA_LIMIT = 200;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -39,7 +42,7 @@ export default {
         });
       }
 
-      if (url.pathname === "/api/comments/delta") {
+      if (isDeltaApiPath(url.pathname)) {
         if (request.method === "OPTIONS") {
           return new Response(null, {
             status: 204,
@@ -63,8 +66,16 @@ export default {
           });
         }
 
-        const query = readCommentDeltaQuery(url);
         const relay = env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME);
+        if (url.pathname === SIMPLE_DELTA_PATH) {
+          return jsonResponse(
+            await relay.commentsDeltaSimple(SIMPLE_DELTA_LIMIT),
+            200,
+            deltaCorsHeaders(),
+          );
+        }
+
+        const query = readCommentDeltaQuery(url);
         return jsonResponse(
           await relay.commentsDelta(
             query.streamId,
@@ -171,7 +182,7 @@ export default {
       return errorResponse(
         errorMessage(error),
         status,
-        url.pathname === "/api/comments/delta" ? deltaCorsHeaders() : {},
+        isDeltaApiPath(url.pathname) ? deltaCorsHeaders() : {},
       );
     }
   },
@@ -181,6 +192,10 @@ interface CommentDeltaQuery {
   streamId: string | null;
   after: number | null;
   limit: number;
+}
+
+function isDeltaApiPath(pathname: string): boolean {
+  return pathname === DELTA_PATH || pathname === SIMPLE_DELTA_PATH;
 }
 
 function readCommentDeltaQuery(url: URL): CommentDeltaQuery {

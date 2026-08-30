@@ -59,6 +59,15 @@ export interface CommentDeltaResponse {
   reset: boolean;
 }
 
+export interface SimpleCommentDeltaResponse {
+  streamId: string;
+  events: CommentDeltaEvent[];
+  windowStartCursor: number;
+  latestCursor: number;
+  truncated: boolean;
+  windowSize: number;
+}
+
 export interface RelayStatus {
   enabled: boolean;
   phase: RelayPhase;
