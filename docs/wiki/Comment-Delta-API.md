@@ -1,10 +1,138 @@
 # 差分コメント取得 API
 
-## 概要
+BLMF Chat Relay には、用途の異なる2種類の差分取得APIがあります。
 
-BLMF Chat Relay が保持している YouTube ライブコメントについて、クライアントが毎回 `comments.json` を全件取得・全件パースせず、前回取得後に発生した変更だけを受け取るための公開 API です。
+| API | 対象クライアント | 特徴 |
+|---|---|---|
+| `GET /api/comments/delta/simple` | URLやクエリパラメータを動的に変更できないワールド側クライアント | 固定URL。直近最大200件を毎回返し、クライアント側で `seq` を使って重複除外 |
+| `GET /api/comments/delta` | クエリパラメータを組み立てられる一般クライアント | `streamId` とカーソルによる厳密な差分取得・ページング |
 
-ワールド側は `streamId` と `nextCursor` を保持し、通常は10秒ごとに差分だけを取得します。コメント総数ではなく、新着・更新・削除の件数に応じた処理量に抑えられます。
+どちらもCloudflare WorkerのURLへアクセスします。次のR2カスタムドメインは静的JSON配信用であり、APIの呼び出し先ではありません。
+
+```text
+https://chat.blmf.bluemoon.works
+```
+
+---
+
+# 固定URL版：`/api/comments/delta/simple`
+
+ワールド側では取得URLを実行中に書き換えられないため、通常はこちらを使用します。
+
+## エンドポイント
+
+```http
+GET https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta/simple
+```
+
+クエリパラメータ、リクエスト本文、認証は不要です。同じURLを通常10秒ごとに取得します。
+
+## 応答例
+
+```json
+{
+  "streamId": "3fdc0f32-5b4a-4c67-9059-a5f97db9237d",
+  "events": [
+    {
+      "seq": 125,
+      "type": "upsert",
+      "id": "youtube-message-id",
+      "name": "視聴者名",
+      "message": "コメント本文",
+      "created_at": "2026-08-31T01:23:45.000Z"
+    }
+  ],
+  "windowStartCursor": 125,
+  "latestCursor": 125,
+  "truncated": false,
+  "windowSize": 200
+}
+```
+
+## 応答フィールド
+
+| フィールド | 説明 |
+|---|---|
+| `streamId` | 現在のリレー実行ID。配信またはリレー実行が切り替わると変わる |
+| `events` | 現在の実行に属する直近最大200件のイベント。`seq` 昇順 |
+| `windowStartCursor` | 応答内で最も古いイベントの `seq`。イベントがなければ0 |
+| `latestCursor` | 応答内で最も新しいイベントの `seq`。イベントがなければ0 |
+| `truncated` | 200件より古いイベントを省略した場合は `true` |
+| `windowSize` | 最大イベント件数。現在は200 |
+
+## クライアントが保持する値
+
+URLへ値を埋め込む必要はありません。ローカルには次の2値だけを保持します。
+
+- 最後に確認した `streamId`
+- 最後に適用した `seq`
+
+## 推奨処理
+
+```text
+streamId = null
+lastSeq = 0
+
+10秒ごとに固定URLをGET:
+  response = GET /api/comments/delta/simple
+
+  初回:
+    streamId = response.streamId
+    lastSeq = response.latestCursor
+    今回のeventsは処理しない
+
+  response.streamId != streamId:
+    ローカルのコメント状態をクリア
+    streamId = response.streamId
+    lastSeq = response.latestCursor
+    今回のeventsは処理しない
+
+  lastSeq + 1 < response.windowStartCursor:
+    200件窓から取りこぼした状態
+    警告を記録
+    lastSeq = response.latestCursor
+    今回のeventsは処理しない
+
+  それ以外:
+    eventsのうち seq > lastSeq のものだけをseq昇順に適用
+      upsert -> idをキーに追加または置換
+      delete -> idをキーに削除
+    lastSeq = response.latestCursor
+```
+
+初回に直近イベントも処理したい場合は、`lastSeq = windowStartCursor - 1` としてから `events` を適用できます。通常のライブ連携では、起動時に過去コメントをまとめて再生しないよう、初回は `latestCursor` まで読み飛ばす方法を推奨します。
+
+## 同じイベントが毎回答えに含まれる理由
+
+固定URL版は、取得時にサーバー側カーソルを進めません。同じ状態なら、同じURLから同じ直近イベントが返ります。
+
+クライアントが `seq > lastSeq` のイベントだけを適用することで、処理対象は実質的に新着分だけになります。
+
+サーバー側でGETのたびに共有カーソルを進める方式は採用していません。この方式には次の問題があるためです。
+
+- 応答の受信に失敗してもイベントが消費され、欠落する
+- ブラウザで動作確認しただけで本番クライアント分のイベントを消費する
+- 複数クライアントがあると、最初にアクセスした1台だけが受け取る
+
+固定ウィンドウ方式なら、再試行や複数クライアントでも同じイベントを安全に取得できます。
+
+## 200件窓と取りこぼし検知
+
+固定URL版は直近200件までを返します。クライアント停止中や通信断の間に200件を超えるイベントが発生すると、古いイベントは取得できません。
+
+次の条件で検出します。
+
+```text
+lastSeq + 1 < windowStartCursor
+```
+
+`truncated: true` は現在の配信に200件を超えるイベントが存在することを示します。ただし、クライアントが直前まで取得できていれば、`truncated: true` でも取りこぼしとは限りません。上記の `lastSeq` 比較で判断します。
+
+すべてのイベントを厳密に回収する必要があり、クエリを変更できるクライアントは後述のカーソル版を使用します。
+
+---
+
+# カーソル版：`/api/comments/delta`
 
 ## エンドポイント
 
@@ -12,33 +140,19 @@ BLMF Chat Relay が保持している YouTube ライブコメントについて�
 GET https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta
 ```
 
-このAPIは **Cloudflare WorkerのURL** に対して呼び出します。
+## クエリパラメータ
 
-次のR2カスタムドメインは静的JSON配信用であり、差分APIの呼び出し先ではありません。
-
-```text
-https://chat.blmf.bluemoon.works
-```
-
-## クエリパラメーター
-
-| パラメーター | 必須 | 説明 |
+| パラメータ | 必須 | 説明 |
 |---|---:|---|
-| `streamId` | 任意 | 前回応答の `streamId`。配信・リレー実行の切り替え検知に使用 |
-| `after` | 任意 | 前回応答の `nextCursor`。この連番より後のイベントだけを返す |
-| `limit` | 任意 | 1回に返す最大イベント数。既定50、最大200 |
-
-`after` は0以上の安全な整数、`limit` は1〜200の整数です。`streamId` は最大128文字です。
+| `streamId` | 任意 | 前回応答の `streamId`。配信・実行の切替検知に使用 |
+| `after` | 任意 | 前回応答の `nextCursor`。この連番より後だけを取得 |
+| `limit` | 任意 | 1回の最大イベント数。既定50、最大200 |
 
 ## 初回取得
-
-初回はパラメーターを付けずに呼び出します。
 
 ```http
 GET /api/comments/delta
 ```
-
-応答例:
 
 ```json
 {
@@ -50,17 +164,13 @@ GET /api/comments/delta
 }
 ```
 
-初回取得では、過去コメントを全件返しません。現在の末尾カーソルだけを返し、以後に発生した変更から受信を開始します。途中参加・再起動直後に大量のコメントを一度にパースしないための仕様です。
+初回は過去履歴を返さず、現在位置だけを返します。
 
-## 2回目以降の取得
-
-前回応答の `streamId` と `nextCursor` を送ります。
+## 2回目以降
 
 ```http
 GET /api/comments/delta?streamId=3fdc0f32-5b4a-4c67-9059-a5f97db9237d&after=124&limit=50
 ```
-
-応答例:
 
 ```json
 {
@@ -81,23 +191,15 @@ GET /api/comments/delta?streamId=3fdc0f32-5b4a-4c67-9059-a5f97db9237d&after=124&
 }
 ```
 
-## 応答フィールド
+`hasMore: true` の場合は、更新された `nextCursor` を `after` に指定してすぐ次ページを取得します。`streamId` が変わった場合や、カーソルが現在範囲外の場合は `reset: true` が返ります。
 
-| フィールド | 説明 |
-|---|---|
-| `streamId` | 現在のリレー実行を表すID。開始対象が切り替わると変わる |
-| `events` | `after` より後に発生した変更。`seq` の昇順 |
-| `nextCursor` | 次回の `after` にそのまま指定する値 |
-| `hasMore` | 上限のため未返却イベントが残っている場合は `true` |
-| `reset` | クライアントの配信状態またはカーソルが現在状態と一致しない場合は `true` |
+---
 
-`seq` はサーバーが発行する単調増加の連番です。投稿日時をカーソルにしないため、同一時刻に複数コメントがあっても取りこぼしません。
+# 共通イベント形式
 
-## イベント種別
+## `upsert`
 
-### `upsert`
-
-新規コメント、または同じコメントIDの内容更新です。クライアント側は `id` をキーに追加または置換します。
+新規コメント、または同じコメントIDの更新です。クライアントは `id` をキーに追加または置換します。
 
 ```json
 {
@@ -110,11 +212,11 @@ GET /api/comments/delta?streamId=3fdc0f32-5b4a-4c67-9059-a5f97db9237d&after=124&
 }
 ```
 
-同じYouTubeページを再取得しても、保存済みコメントと内容が同じなら新しいイベントは追加しません。
+同じYouTubeページを再取得しても、保存済み内容と同一ならイベントは追加されません。
 
-### `delete`
+## `delete`
 
-YouTube上でのコメント削除、または投稿者BANによる削除です。クライアント側は `id` をキーにコメントを削除します。
+YouTube上のコメント削除、または投稿者BANによる削除です。クライアントは `id` をキーに削除します。
 
 ```json
 {
@@ -127,64 +229,27 @@ YouTube上でのコメント削除、または投稿者BANによる削除です�
 }
 ```
 
-投稿者BANの場合、その投稿者について現在保存されているコメントごとに `delete` イベントを返します。
+投稿者BANでは、現在保存されているその投稿者の各コメントについて `delete` が発生します。
 
-## 配信切り替えとリセット
+`seq` はサーバー発行の単調増加連番です。同じ投稿時刻のコメントが複数あっても、時刻をカーソルにしないため取りこぼしません。
 
-新しいリレー実行が始まると `streamId` が変わります。古い `streamId` を送った場合は、現在位置へ安全にリセットします。
+# HTTP・CORS
 
-```json
-{
-  "streamId": "new-stream-id",
-  "events": [],
-  "nextCursor": 230,
-  "hasMore": false,
-  "reset": true
-}
-```
-
-この場合、クライアントは古い配信のローカル状態を破棄し、返された `streamId` と `nextCursor` から取得を再開します。`after` が現在の末尾より大きい場合も `reset: true` になります。
-
-## クライアント実装例
-
-```text
-streamId = null
-cursor = null
-
-10秒ごとに:
-  GET /api/comments/delta?streamId=<streamId>&after=<cursor>&limit=50
-
-  reset が true、または保存中の streamId と応答の streamId が異なる:
-    ローカルのコメント状態をクリアする
-
-  events を seq 順に適用する:
-    upsert -> id をキーに追加・置換
-    delete -> id をキーに削除
-
-  streamId = 応答.streamId
-  cursor = 応答.nextCursor
-
-  hasMore が true:
-    10秒待たず、更新した cursor ですぐ次ページを取得する
-```
-
-通信失敗時は、保存済みの同じカーソルで再試行できます。同じ `after` を再送すると同じイベントが返り得るため、クライアント側でも `seq` または `id` を使って冪等に適用してください。`nextCursor` を永続化する場合は、応答内イベントをすべて適用した後に保存します。
-
-## HTTP・CORS仕様
+両APIに共通です。
 
 - 認証不要
 - `GET` と `OPTIONS` に対応
 - `Access-Control-Allow-Origin: *`
-- 不正なクエリは HTTP 400
 - `GET` / `OPTIONS` 以外は HTTP 405
 - 通常応答は `Cache-Control: no-store`
 
-## 既存機能への影響
+# 既存機能への影響
 
-外部互換性は維持されています。次の既存機能・形式は変更していません。
+固定URL版の追加によって、次の既存機能・形式は変更されません。
 
 | 既存機能 | 影響 |
 |---|---|
+| `GET /api/comments/delta` | 従来のカーソル方式を維持 |
 | `GET /health` | 変更なし |
 | `GET /api/status` | 変更なし |
 | `POST /api/start` | 変更なし |
@@ -194,39 +259,30 @@ cursor = null
 | R2 `comments.json` | 形式・出力を維持 |
 | R2 `status.json` | 形式・出力を維持 |
 | `streams/{videoId}/comments.json` | 形式・出力を維持 |
-| 既存クライアント | 修正不要。従来どおり全件JSONを利用可能 |
 
-内部では Durable Object SQLite に `comment_events` テーブルを追加し、コメントの新規・更新・削除時にイベントを追記します。配信切り替え時には、正常にアーカイブできた古い実行のコメントとイベントを削除します。
+固定URL版は既存のDurable Object SQLiteイベントログを読み取るだけです。API取得による書き込み、カーソル消費、YouTube API呼び出しは発生しません。
 
-なお、差分APIはワールド側の全件取得・全件パースを解消するものです。後方互換のため、リレー側によるR2の全件スナップショット生成は引き続き行います。
+# 本番確認
 
-## テスト済み項目
+固定URL版:
 
-- 新着なし
-- 同一時刻の複数コメント
-- 同一カーソルでの再取得
-- 複数ページと上限到達
-- 配信切り替え
-- 範囲外カーソル
-- コメント更新
-- 個別コメント削除
-- 投稿者BANによる複数削除
-- 既存R2出力との互換性
+```bash
+curl -i \
+  'https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta/simple'
+```
 
-Wrangler型生成、TypeScript型検査、Vitest 23件が成功した状態で `main` にマージされています。
-
-## 本番確認
+カーソル版:
 
 ```bash
 curl -i \
   'https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta'
 ```
 
-HTTP 404になる場合は、Cloudflare Workerが差分API追加前のコミットを実行している可能性があります。最新の `main` をデプロイしてから再確認してください。
+HTTP 404になる場合は、Cloudflare WorkerがAPI追加前のコミットを実行している可能性があります。最新の `main` をデプロイしてから確認してください。
 
-## 関連情報
+# 関連情報
 
-- Issue #3: 差分コメント取得APIを追加し、ワールド側の全件パースを解消する
-- PR #5: feat: 差分コメント取得APIを追加
-- リポジトリ内詳細資料: `docs/delta-api.md`
-- マージコミット: `3a3ad388dfb2cd1e4ade539d86f7146c748b651c`
+- Issue #3：カーソル方式の差分コメント取得API
+- PR #5：カーソル方式の実装
+- Issue #6：固定URLで取得できる単純差分API
+- リポジトリ内詳細資料：`docs/delta-api.md`、`docs/simple-delta-api.md`
