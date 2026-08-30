@@ -1,0 +1,86 @@
+name: Sync API specification to Wiki
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - docs/wiki/Comment-Delta-API.md
+      - .github/workflows/sync-wiki.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-blmf-chat-relay-wiki
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Publish Wiki page
+        env:
+          WIKI_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          wiki_dir="${RUNNER_TEMP}/blmf-chat-relay-wiki"
+          wiki_url="https://x-access-token:${WIKI_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          rm -rf "${wiki_dir}"
+
+          if ! git clone "${wiki_url}" "${wiki_dir}"; then
+            mkdir -p "${wiki_dir}"
+            git -C "${wiki_dir}" init -b master
+            git -C "${wiki_dir}" remote add origin "${wiki_url}"
+          fi
+
+          cp docs/wiki/Comment-Delta-API.md \
+            "${wiki_dir}/Comment-Delta-API.md"
+
+          page_link='* [[差分コメント取得 API|Comment-Delta-API]]'
+
+          if [[ ! -f "${wiki_dir}/Home.md" ]]; then
+            cat > "${wiki_dir}/Home.md" <<'EOF'
+          # BLMF Chat Relay Wiki
+
+          * [[差分コメント取得 API|Comment-Delta-API]]
+          EOF
+          elif ! grep -Fq '[[差分コメント取得 API|Comment-Delta-API]]' \
+            "${wiki_dir}/Home.md"; then
+            printf '\n## API仕様\n\n%s\n' "${page_link}" \
+              >> "${wiki_dir}/Home.md"
+          fi
+
+          if [[ ! -f "${wiki_dir}/_Sidebar.md" ]]; then
+            printf '%s\n' "${page_link}" > "${wiki_dir}/_Sidebar.md"
+          elif ! grep -Fq '[[差分コメント取得 API|Comment-Delta-API]]' \
+            "${wiki_dir}/_Sidebar.md"; then
+            printf '\n%s\n' "${page_link}" >> "${wiki_dir}/_Sidebar.md"
+          fi
+
+          git -C "${wiki_dir}" config user.name "github-actions[bot]"
+          git -C "${wiki_dir}" config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "${wiki_dir}" add \
+            Comment-Delta-API.md Home.md _Sidebar.md
+
+          if git -C "${wiki_dir}" diff --cached --quiet; then
+            echo "Wiki is already up to date."
+            exit 0
+          fi
+
+          git -C "${wiki_dir}" commit -m \
+            "docs: publish comment delta API specification"
+          wiki_branch="$(git -C "${wiki_dir}" branch --show-current)"
+          if [[ -z "${wiki_branch}" ]]; then
+            wiki_branch="master"
+          fi
+          git -C "${wiki_dir}" push origin "HEAD:${wiki_branch}"
