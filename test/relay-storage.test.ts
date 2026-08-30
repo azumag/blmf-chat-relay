@@ -177,6 +177,16 @@ describe("comment delta storage", () => {
     expect(third.events.map((event) => event.id)).toEqual(["comment-5"]);
     expect(third.nextCursor).toBe(5);
     expect(third.hasMore).toBe(false);
+
+    expect(
+      getCommentDelta(storage, "run-1", "run-1", third.nextCursor, 2),
+    ).toEqual({
+      streamId: "run-1",
+      events: [],
+      nextCursor: 5,
+      hasMore: false,
+      reset: false,
+    });
   });
 
   it("初回は現在位置だけを返し、stream切替時は履歴を大量再生しない", () => {
