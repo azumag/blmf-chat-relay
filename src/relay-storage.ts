@@ -5,6 +5,7 @@ import {
   type CommentDeltaResponse,
   type ExportedComment,
   type RelayState,
+  type SimpleCommentDeltaResponse,
   type StoredComment,
 } from "./types";
 import {
@@ -252,6 +253,40 @@ export function getCommentDelta(
     nextCursor: page.at(-1)?.seq ?? after,
     hasMore,
     reset: false,
+  };
+}
+
+export function getSimpleCommentDelta(
+  storage: DurableObjectStorage,
+  currentRunId: string,
+  limit: number,
+): SimpleCommentDeltaResponse {
+  const safeLimit = Math.min(200, Math.max(1, Math.trunc(limit)));
+  const rows = storage.sql
+    .exec<CommentEventRow>(
+      `SELECT seq, type, comment_id, name, message, created_at
+       FROM comment_events
+       WHERE run_id = ?
+       ORDER BY seq DESC
+       LIMIT ?`,
+      currentRunId,
+      safeLimit + 1,
+    )
+    .toArray();
+  const truncated = rows.length > safeLimit;
+  const events = rows
+    .slice(0, safeLimit)
+    .reverse()
+    .map(toCommentDeltaEvent);
+  const latestCursor = events.at(-1)?.seq ?? 0;
+
+  return {
+    streamId: currentRunId,
+    events,
+    windowStartCursor: events[0]?.seq ?? latestCursor,
+    latestCursor,
+    truncated,
+    windowSize: safeLimit,
   };
 }
 
