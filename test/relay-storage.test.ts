@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   applyChatItems,
   getCommentDelta,
+  getSimpleCommentDelta,
   initializeRelayStorage,
   listComments,
 } from "../src/relay-storage";
@@ -236,6 +237,83 @@ describe("comment delta storage", () => {
       hasMore: false,
       reset: true,
     });
+  });
+});
+
+describe("simple comment delta storage", () => {
+  it("イベントがない場合も固定した応答形式を返す", () => {
+    const storage = createStorage();
+
+    expect(getSimpleCommentDelta(storage, "run-1", 200)).toEqual({
+      streamId: "run-1",
+      events: [],
+      windowStartCursor: 0,
+      latestCursor: 0,
+      truncated: false,
+      windowSize: 200,
+    });
+  });
+
+  it("直近の固定件数だけを昇順で返し、再取得では状態を消費しない", () => {
+    const storage = createStorage();
+    applyChatItems(
+      storage,
+      "run-1",
+      Array.from({ length: 205 }, (_, index) =>
+        comment(
+          `comment-${index + 1}`,
+          `viewer-${index + 1}`,
+          String(index + 1),
+        ),
+      ),
+    );
+
+    const first = getSimpleCommentDelta(storage, "run-1", 200);
+    expect(first.events).toHaveLength(200);
+    expect(first.events[0]?.id).toBe("comment-6");
+    expect(first.events.at(-1)?.id).toBe("comment-205");
+    expect(first.windowStartCursor).toBe(6);
+    expect(first.latestCursor).toBe(205);
+    expect(first.truncated).toBe(true);
+    expect(first.windowSize).toBe(200);
+    expect(getSimpleCommentDelta(storage, "run-1", 200)).toEqual(first);
+
+    applyChatItems(storage, "run-1", [
+      comment("comment-206", "viewer-206", "206"),
+    ]);
+    const second = getSimpleCommentDelta(storage, "run-1", 200);
+    expect(second.events[0]?.id).toBe("comment-7");
+    expect(second.events.at(-1)?.id).toBe("comment-206");
+    expect(second.windowStartCursor).toBe(7);
+    expect(second.latestCursor).toBe(206);
+  });
+
+  it("現在のstreamだけを返し、更新・削除イベントをそのまま含める", () => {
+    const storage = createStorage();
+    applyChatItems(storage, "run-1", [
+      comment("old-comment", "viewer-old", "old"),
+    ]);
+    applyChatItems(storage, "run-2", [
+      comment("comment-1", "viewer-1", "before"),
+    ]);
+    applyChatItems(storage, "run-2", [
+      comment("comment-1", "viewer-1", "after"),
+    ]);
+    applyChatItems(storage, "run-2", [deletedMessage("comment-1")]);
+
+    const delta = getSimpleCommentDelta(storage, "run-2", 200);
+    expect(delta.streamId).toBe("run-2");
+    expect(delta.events.map((event) => [event.type, event.id])).toEqual([
+      ["upsert", "comment-1"],
+      ["upsert", "comment-1"],
+      ["delete", "comment-1"],
+    ]);
+    expect(delta.events.some((event) => event.id === "old-comment")).toBe(
+      false,
+    );
+    expect(delta.windowStartCursor).toBe(2);
+    expect(delta.latestCursor).toBe(4);
+    expect(delta.truncated).toBe(false);
   });
 });
 
