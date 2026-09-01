@@ -12,6 +12,7 @@ import {
   deleteRunEvents,
   getCommentDelta,
   getSimpleCommentDelta,
+  getSimpleCommentDeltaFromSnapshot,
   initializeRelayStorage,
   listComments,
   loadRelayState,
@@ -86,9 +87,34 @@ export class YouTubeChatRelay extends DurableObject<Env> {
   async commentsDeltaSimple(
     limit: number,
   ): Promise<SimpleCommentDeltaResponse> {
-    return this.runSerially(() => {
+    return this.runSerially(async () => {
       const state = this.loadState();
-      return getSimpleCommentDelta(this.ctx.storage, state.runId, limit);
+      const delta = getSimpleCommentDelta(this.ctx.storage, state.runId, limit);
+      if (state.enabled || delta.events.length > 0) {
+        return delta;
+      }
+
+      const config = readRelayConfig(this.env);
+      const object = await this.env.COMMENTS_BUCKET.get(config.currentObjectKey);
+      if (object === null) {
+        return delta;
+      }
+
+      try {
+        const snapshot = await object.json<unknown>();
+        if (!Array.isArray(snapshot)) {
+          return delta;
+        }
+        return getSimpleCommentDeltaFromSnapshot(
+          snapshot.filter(isExportedComment),
+          limit,
+        );
+      } catch (error) {
+        this.log("simple_delta_snapshot_error", {
+          message: errorMessage(error),
+        });
+        return delta;
+      }
     });
   }
 
@@ -501,4 +527,20 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       }),
     );
   }
+}
+
+function isExportedComment(value: unknown): value is {
+  name: string;
+  message: string;
+  created_at: string;
+} {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const comment = value as Record<string, unknown>;
+  return (
+    typeof comment.name === "string" &&
+    typeof comment.message === "string" &&
+    typeof comment.created_at === "string"
+  );
 }

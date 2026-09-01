@@ -27,6 +27,8 @@ GET https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta/s
 
 クエリパラメータ、リクエスト本文、認証は不要です。同じURLを通常10秒ごとに取得します。
 
+リレー停止中で現在の実行に差分イベントがない場合は、R2の既存 `comments.json` から最新50件を初期イベントとして返します。このとき `streamId` は `snapshot` です。ライブのリレーが開始すると新しい `streamId` に切り替わり、以後は実際のライブ差分イベントを返します。
+
 ## 応答例
 
 ```json

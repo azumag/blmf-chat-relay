@@ -3,6 +3,7 @@ import {
   applyChatItems,
   getCommentDelta,
   getSimpleCommentDelta,
+  getSimpleCommentDeltaFromSnapshot,
   initializeRelayStorage,
   listComments,
 } from "../src/relay-storage";
@@ -241,6 +242,32 @@ describe("comment delta storage", () => {
 });
 
 describe("simple comment delta storage", () => {
+  it("停止中のスナップショットから最新50件を初期イベントとして返す", () => {
+    const comments = Array.from({ length: 55 }, (_, index) => ({
+      name: `viewer-${index + 1}`,
+      message: `message-${index + 1}`,
+      created_at: `2026-08-27T00:00:${String(index).padStart(2, "0")}.000Z`,
+    }));
+
+    const delta = getSimpleCommentDeltaFromSnapshot(comments, 50);
+    expect(delta.streamId).toBe("snapshot");
+    expect(delta.events).toHaveLength(50);
+    expect(delta.events[0]).toMatchObject({
+      seq: 6,
+      id: "snapshot-6",
+      message: "message-6",
+    });
+    expect(delta.events.at(-1)).toMatchObject({
+      seq: 55,
+      id: "snapshot-55",
+      message: "message-55",
+    });
+    expect(delta.windowStartCursor).toBe(6);
+    expect(delta.latestCursor).toBe(55);
+    expect(delta.truncated).toBe(true);
+    expect(delta.windowSize).toBe(50);
+  });
+
   it("イベントがない場合も固定した応答形式を返す", () => {
     const storage = createStorage();
 
