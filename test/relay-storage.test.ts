@@ -244,13 +244,13 @@ describe("simple comment delta storage", () => {
   it("イベントがない場合も固定した応答形式を返す", () => {
     const storage = createStorage();
 
-    expect(getSimpleCommentDelta(storage, "run-1", 200)).toEqual({
+    expect(getSimpleCommentDelta(storage, "run-1", 50)).toEqual({
       streamId: "run-1",
       events: [],
       windowStartCursor: 0,
       latestCursor: 0,
       truncated: false,
-      windowSize: 200,
+      windowSize: 50,
     });
   });
 
@@ -259,7 +259,7 @@ describe("simple comment delta storage", () => {
     applyChatItems(
       storage,
       "run-1",
-      Array.from({ length: 205 }, (_, index) =>
+      Array.from({ length: 55 }, (_, index) =>
         comment(
           `comment-${index + 1}`,
           `viewer-${index + 1}`,
@@ -269,23 +269,23 @@ describe("simple comment delta storage", () => {
     );
 
     const first = getSimpleCommentDelta(storage, "run-1", 200);
-    expect(first.events).toHaveLength(200);
+    expect(first.events).toHaveLength(50);
     expect(first.events[0]?.id).toBe("comment-6");
-    expect(first.events.at(-1)?.id).toBe("comment-205");
+    expect(first.events.at(-1)?.id).toBe("comment-55");
     expect(first.windowStartCursor).toBe(6);
-    expect(first.latestCursor).toBe(205);
+    expect(first.latestCursor).toBe(55);
     expect(first.truncated).toBe(true);
-    expect(first.windowSize).toBe(200);
+    expect(first.windowSize).toBe(50);
     expect(getSimpleCommentDelta(storage, "run-1", 200)).toEqual(first);
 
     applyChatItems(storage, "run-1", [
-      comment("comment-206", "viewer-206", "206"),
+      comment("comment-56", "viewer-56", "56"),
     ]);
     const second = getSimpleCommentDelta(storage, "run-1", 200);
     expect(second.events[0]?.id).toBe("comment-7");
-    expect(second.events.at(-1)?.id).toBe("comment-206");
+    expect(second.events.at(-1)?.id).toBe("comment-56");
     expect(second.windowStartCursor).toBe(7);
-    expect(second.latestCursor).toBe(206);
+    expect(second.latestCursor).toBe(56);
   });
 
   it("現在のstreamだけを返し、更新・削除イベントをそのまま含める", () => {
@@ -301,7 +301,7 @@ describe("simple comment delta storage", () => {
     ]);
     applyChatItems(storage, "run-2", [deletedMessage("comment-1")]);
 
-    const delta = getSimpleCommentDelta(storage, "run-2", 200);
+    const delta = getSimpleCommentDelta(storage, "run-2", 50);
     expect(delta.streamId).toBe("run-2");
     expect(delta.events.map((event) => [event.type, event.id])).toEqual([
       ["upsert", "comment-1"],
