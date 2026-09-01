@@ -8,7 +8,7 @@ const DELTA_PATH = "/api/comments/delta";
 const SIMPLE_DELTA_PATH = "/api/comments/delta/simple";
 const DELTA_DEFAULT_LIMIT = 50;
 const DELTA_MAX_LIMIT = 200;
-const SIMPLE_DELTA_LIMIT = 200;
+const SIMPLE_DELTA_LIMIT = 50;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

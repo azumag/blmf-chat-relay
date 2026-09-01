@@ -4,7 +4,7 @@ BLMF Chat Relay には、用途の異なる2種類の差分取得APIがありま
 
 | API | 対象クライアント | 特徴 |
 |---|---|---|
-| `GET /api/comments/delta/simple` | URLやクエリパラメータを動的に変更できないワールド側クライアント | 固定URL。直近最大200件を毎回返し、クライアント側で `seq` を使って重複除外 |
+| `GET /api/comments/delta/simple` | URLやクエリパラメータを動的に変更できないワールド側クライアント | 固定URL。直近最大50件を毎回返し、クライアント側で `seq` を使って重複除外 |
 | `GET /api/comments/delta` | クエリパラメータを組み立てられる一般クライアント | `streamId` とカーソルによる厳密な差分取得・ページング |
 
 どちらもCloudflare WorkerのURLへアクセスします。次のR2カスタムドメインは静的JSON配信用であり、APIの呼び出し先ではありません。
@@ -45,7 +45,7 @@ GET https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta/s
   "windowStartCursor": 125,
   "latestCursor": 125,
   "truncated": false,
-  "windowSize": 200
+  "windowSize": 50
 }
 ```
 
@@ -54,11 +54,11 @@ GET https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta/s
 | フィールド | 説明 |
 |---|---|
 | `streamId` | 現在のリレー実行ID。配信またはリレー実行が切り替わると変わる |
-| `events` | 現在の実行に属する直近最大200件のイベント。`seq` 昇順 |
+| `events` | 現在の実行に属する直近最大50件のイベント。`seq` 昇順 |
 | `windowStartCursor` | 応答内で最も古いイベントの `seq`。イベントがなければ0 |
 | `latestCursor` | 応答内で最も新しいイベントの `seq`。イベントがなければ0 |
-| `truncated` | 200件より古いイベントを省略した場合は `true` |
-| `windowSize` | 最大イベント件数。現在は200 |
+| `truncated` | 50件より古いイベントを省略した場合は `true` |
+| `windowSize` | 最大イベント件数。現在は50 |
 
 ## クライアントが保持する値
 
@@ -78,29 +78,25 @@ lastSeq = 0
 
   初回:
     streamId = response.streamId
-    lastSeq = response.latestCursor
-    今回のeventsは処理しない
+    lastSeq = response.windowStartCursor - 1
 
   response.streamId != streamId:
     ローカルのコメント状態をクリア
     streamId = response.streamId
-    lastSeq = response.latestCursor
-    今回のeventsは処理しない
+    lastSeq = response.windowStartCursor - 1
 
   lastSeq + 1 < response.windowStartCursor:
-    200件窓から取りこぼした状態
+    50件窓から取りこぼした状態
     警告を記録
-    lastSeq = response.latestCursor
-    今回のeventsは処理しない
+    lastSeq = response.windowStartCursor - 1
 
-  それ以外:
-    eventsのうち seq > lastSeq のものだけをseq昇順に適用
-      upsert -> idをキーに追加または置換
-      delete -> idをキーに削除
-    lastSeq = response.latestCursor
+  eventsのうち seq > lastSeq のものだけをseq昇順に適用
+    upsert -> idをキーに追加または置換
+    delete -> idをキーに削除
+  lastSeq = response.latestCursor
 ```
 
-初回に直近イベントも処理したい場合は、`lastSeq = windowStartCursor - 1` としてから `events` を適用できます。通常のライブ連携では、起動時に過去コメントをまとめて再生しないよう、初回は `latestCursor` まで読み飛ばす方法を推奨します。
+初回、`streamId` の変更時、取りこぼし検出時も、応答に含まれる `events` を適用します。表示側を最新20件程度の固定サイズに保つことで、復帰時に表示が過剰に増えることを防ぎます。
 
 ## 同じイベントが毎回答えに含まれる理由
 
@@ -116,9 +112,9 @@ lastSeq = 0
 
 固定ウィンドウ方式なら、再試行や複数クライアントでも同じイベントを安全に取得できます。
 
-## 200件窓と取りこぼし検知
+## 50件窓と取りこぼし検知
 
-固定URL版は直近200件までを返します。クライアント停止中や通信断の間に200件を超えるイベントが発生すると、古いイベントは取得できません。
+固定URL版は直近50件までを返します。クライアント停止中や通信断の間に50件を超えるイベントが発生すると、古いイベントは取得できません。
 
 次の条件で検出します。
 
@@ -126,7 +122,7 @@ lastSeq = 0
 lastSeq + 1 < windowStartCursor
 ```
 
-`truncated: true` は現在の配信に200件を超えるイベントが存在することを示します。ただし、クライアントが直前まで取得できていれば、`truncated: true` でも取りこぼしとは限りません。上記の `lastSeq` 比較で判断します。
+`truncated: true` は現在の配信に50件を超えるイベントが存在することを示します。ただし、クライアントが直前まで取得できていれば、`truncated: true` でも取りこぼしとは限りません。上記の `lastSeq` 比較で判断します。
 
 すべてのイベントを厳密に回収する必要があり、クエリを変更できるクライアントは後述のカーソル版を使用します。
 

@@ -36,18 +36,18 @@ https://blmf-chat-relay.tsubasa-azumagakito.workers.dev/api/comments/delta/simpl
   "windowStartCursor": 125,
   "latestCursor": 125,
   "truncated": false,
-  "windowSize": 200
+  "windowSize": 50
 }
 ```
 
 | フィールド | 説明 |
 |---|---|
 | `streamId` | 現在のリレー実行ID。配信・リレー実行が切り替わると変わる |
-| `events` | 現在の実行に属する直近最大200件のイベント。`seq` 昇順 |
+| `events` | 現在の実行に属する直近最大50件のイベント。`seq` 昇順 |
 | `windowStartCursor` | 応答内で最も古いイベントの `seq`。イベントがなければ0 |
 | `latestCursor` | 応答内で最も新しいイベントの `seq`。イベントがなければ0 |
-| `truncated` | 現在の実行に200件を超えるイベントがあり、古いイベントを省略した場合は `true` |
-| `windowSize` | サーバーが返す最大イベント件数。現在は200 |
+| `truncated` | 現在の実行に50件を超えるイベントがあり、古いイベントを省略した場合は `true` |
+| `windowSize` | サーバーが返す最大イベント件数。現在は50 |
 
 ## クライアント処理
 
@@ -65,29 +65,25 @@ lastSeq = 0
 
   初回:
     streamId = response.streamId
-    lastSeq = response.latestCursor
-    eventsは処理しない
+    lastSeq = response.windowStartCursor - 1
 
   response.streamId != streamId:
     ローカルのコメント状態をクリア
     streamId = response.streamId
-    lastSeq = response.latestCursor
-    eventsは処理しない
+    lastSeq = response.windowStartCursor - 1
 
   lastSeq + 1 < response.windowStartCursor:
-    200件窓から取りこぼした状態
+    50件窓から取りこぼした状態
     必要な警告を記録
-    lastSeq = response.latestCursor
-    今回のeventsは処理しない
+    lastSeq = response.windowStartCursor - 1
 
-  それ以外:
-    eventsのうち seq > lastSeq のものだけをseq昇順に適用
-      upsert -> idをキーに追加または置換
-      delete -> idをキーに削除
-    lastSeq = response.latestCursor
+  eventsのうち seq > lastSeq のものだけをseq昇順に適用
+    upsert -> idをキーに追加または置換
+    delete -> idをキーに削除
+  lastSeq = response.latestCursor
 ```
 
-初回に直近イベントも処理したい用途では、`lastSeq = response.windowStartCursor - 1` としてから `events` を適用できる。通常のライブ連携では、起動時に過去コメントをまとめて再生しないよう、初回は `latestCursor` まで読み飛ばすことを推奨する。
+初回、`streamId` の変更時、取りこぼし検出時も、応答に含まれる `events` は適用する。表示側を最新20件程度の固定サイズに保つことで、復帰時に表示が過剰に増えることを防ぐ。
 
 ## 再取得と複数クライアント
 
@@ -101,11 +97,11 @@ lastSeq = 0
 
 重複排除はクライアント側で `streamId` と `seq` を使って行う。
 
-## 200件窓の制約
+## 50件窓の制約
 
-固定URLかつサーバー側でクライアント識別を行わないため、応答は直近200件のローリングウィンドウとなる。
+固定URLかつサーバー側でクライアント識別を行わないため、応答は直近50件のローリングウィンドウとなる。
 
-クライアントの停止中や通信断の間に200件を超えるイベントが発生すると、古いイベントは取得できない。次の条件で検出できる。
+クライアントの停止中や通信断の間に50件を超えるイベントが発生すると、古いイベントは取得できない。次の条件で検出できる。
 
 ```text
 lastSeq + 1 < windowStartCursor

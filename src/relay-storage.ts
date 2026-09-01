@@ -261,7 +261,7 @@ export function getSimpleCommentDelta(
   currentRunId: string,
   limit: number,
 ): SimpleCommentDeltaResponse {
-  const safeLimit = Math.min(200, Math.max(1, Math.trunc(limit)));
+  const safeLimit = Math.min(50, Math.max(1, Math.trunc(limit)));
   const rows = storage.sql
     .exec<CommentEventRow>(
       `SELECT seq, type, comment_id, name, message, created_at
