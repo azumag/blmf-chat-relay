@@ -290,6 +290,33 @@ export function getSimpleCommentDelta(
   };
 }
 
+export function getSimpleCommentDeltaFromSnapshot(
+  comments: ExportedComment[],
+  limit: number,
+): SimpleCommentDeltaResponse {
+  const safeLimit = Math.min(50, Math.max(1, Math.trunc(limit)));
+  const selected = comments.slice(-safeLimit);
+  const offset = comments.length - selected.length;
+  const events = selected.map((comment, index) => ({
+    seq: offset + index + 1,
+    type: "upsert" as const,
+    id: `snapshot-${offset + index + 1}`,
+    name: comment.name,
+    message: comment.message,
+    created_at: comment.created_at,
+  }));
+  const latestCursor = events.at(-1)?.seq ?? 0;
+
+  return {
+    streamId: "snapshot",
+    events,
+    windowStartCursor: events[0]?.seq ?? latestCursor,
+    latestCursor,
+    truncated: comments.length > safeLimit,
+    windowSize: safeLimit,
+  };
+}
+
 export function listComments(
   storage: DurableObjectStorage,
   runId: string,
