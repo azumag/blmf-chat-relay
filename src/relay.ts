@@ -6,7 +6,11 @@ import {
 } from "./relay-cycle";
 import { errorMessage, isFatalYouTubeError } from "./relay-errors";
 import { flushRelaySnapshot } from "./relay-r2";
+import { nextRelayAlarm } from "./relay-schedule";
+import { TWITCH_EVENT_TYPES, twitchConfig, type TwitchDelivery } from "./twitch";
 import {
+  acceptTwitchDelivery,
+  applyTwitchDelivery,
   countComments,
   deleteRunComments,
   deleteRunEvents,
@@ -52,19 +56,103 @@ export class YouTubeChatRelay extends DurableObject<Env> {
   }
 
   async start(channelRef: string): Promise<RelayStatus> {
-    return this.runSerially(() => this.startInternal(channelRef));
+    return this.runSerially(() => this.startInternal(channelRef), true);
   }
 
   async startE2E(channelRef: string, videoId: string): Promise<RelayStatus> {
-    return this.runSerially(() => this.startE2EInternal(channelRef, videoId));
+    return this.runSerially(() => this.startE2EInternal(channelRef, videoId), true);
   }
 
   async stop(reason = "manual"): Promise<RelayStatus> {
-    return this.runSerially(() => this.stopInternal(reason));
+    return this.runSerially(() => this.stopInternal(reason), true);
   }
 
   async status(): Promise<RelayStatus> {
     return this.runSerially(() => this.currentStatus());
+  }
+
+  async startTwitch(): Promise<RelayStatus> {
+    return this.runSerially(async () => {
+      const config = twitchConfig(this.env);
+      let state = this.loadState();
+      if (!state.enabled && !state.twitch.enabled) {
+        await this.archiveAndClearRun(state);
+        state = { ...createRunningState(""), enabled: false, phase: "stopped", channelRef: null,
+          nextActionAt: null, twitch: state.twitch };
+      }
+      const sameChannel = state.twitch.broadcasterId === config.broadcasterId;
+      const subscriptions = sameChannel ? state.twitch.subscriptions : {};
+      state = { ...state, twitch: { ...state.twitch, enabled: true,
+        channel: config.channel, broadcasterId: config.broadcasterId, subscriptions,
+        phase: TWITCH_EVENT_TYPES.every((type) => subscriptions[type]) ? "running" : "waiting",
+        startedAt: state.twitch.enabled && sameChannel ? state.twitch.startedAt : new Date().toISOString(),
+        lastError: null, lastReceivedAt: state.twitch.enabled && sameChannel ? state.twitch.lastReceivedAt : null,
+      } };
+      this.saveState(state);
+      return this.statusFor((await this.safeFlushSnapshot(state, true)).state);
+    }, true);
+  }
+
+  async stopTwitch(): Promise<RelayStatus> {
+    return this.runSerially(async () => {
+      const state = this.loadState();
+      const stopped: RelayState = { ...state, twitch: { ...state.twitch, enabled: false, phase: "stopped" } };
+      this.saveState(stopped);
+      return this.statusFor((await this.safeFlushSnapshot(stopped, true)).state);
+    }, true);
+  }
+
+  async receiveTwitch(delivery: TwitchDelivery): Promise<void> {
+    // ACK after durable enqueue, without waiting on YouTube HTTP or R2 writes.
+    await this.ctx.storage.transaction(async (transaction) => {
+      if (!acceptTwitchDelivery(this.ctx.storage, delivery.id)) return;
+      this.ctx.storage.sql.exec("INSERT INTO twitch_pending (delivery) VALUES (?)", JSON.stringify(delivery));
+      const alarm = await transaction.getAlarm();
+      if (alarm === null || alarm > Date.now()) await transaction.setAlarm(Date.now());
+    });
+  }
+
+  private drainTwitch(all = false): void {
+    this.ctx.storage.transactionSync(() => {
+      const pending = this.ctx.storage.sql.exec<{ seq: number; delivery: string }>(
+        "SELECT seq, delivery FROM twitch_pending ORDER BY seq LIMIT ?", all ? -1 : 200,
+      ).toArray();
+      for (const row of pending) {
+        const delivery = JSON.parse(row.delivery) as TwitchDelivery;
+        this.ctx.storage.sql.exec("DELETE FROM twitch_pending WHERE seq = ?", row.seq);
+        let state = this.loadState();
+        const twitch = { ...state.twitch, subscriptions: { ...state.twitch.subscriptions } };
+        if (delivery.kind === "webhook_callback_verification") {
+          if (twitch.broadcasterId !== delivery.broadcasterId) twitch.subscriptions = {};
+          twitch.broadcasterId = delivery.broadcasterId;
+          twitch.channel = this.env.DEFAULT_TWITCH_CHANNEL.trim().toLowerCase();
+          twitch.subscriptions[delivery.type] = delivery.subscriptionId;
+          if (twitch.enabled && TWITCH_EVENT_TYPES.every((type) => twitch.subscriptions[type])) {
+            twitch.phase = "running";
+            twitch.lastError = null;
+          }
+        } else {
+          if (twitch.broadcasterId !== delivery.broadcasterId ||
+              twitch.subscriptions[delivery.type] !== delivery.subscriptionId) continue;
+          if (delivery.kind === "revocation") {
+            delete twitch.subscriptions[delivery.type];
+            twitch.phase = twitch.enabled ? "error" : "stopped";
+            twitch.lastError = `Twitch: ${delivery.type} (${delivery.reason})。購読を再設定してください。`;
+          } else {
+            if (!twitch.enabled || Date.parse(delivery.timestamp) < Date.parse(twitch.startedAt ?? "")) continue;
+            applyTwitchDelivery(this.ctx.storage, state.runId, delivery);
+            twitch.lastReceivedAt = new Date().toISOString();
+          }
+        }
+        // Registering webhooks before the first session must not replace the pre-live R2 snapshot.
+        if (state.startedAt !== null) {
+          twitch.flushAt ??= new Date(Math.max(Date.now(),
+            (Date.parse(state.lastFlushAt ?? "") || 0) + readRelayConfig(this.env).r2FlushIntervalMs)).toISOString();
+        }
+        state = { ...state, twitch, updatedAt: new Date().toISOString() };
+        this.saveState(state);
+      }
+    });
   }
 
   async commentsDelta(
@@ -90,7 +178,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     return this.runSerially(async () => {
       const state = this.loadState();
       const delta = getSimpleCommentDelta(this.ctx.storage, state.runId, limit);
-      if (state.enabled || delta.events.length > 0) {
+      if (state.enabled || state.twitch.enabled || delta.events.length > 0) {
         return delta;
       }
 
@@ -120,9 +208,12 @@ export class YouTubeChatRelay extends DurableObject<Env> {
 
   override async alarm(): Promise<void> {
     await this.runSerially(async () => {
-      const state = this.loadState();
+      let state = this.loadState();
+      if (state.twitch.flushAt !== null && Date.parse(state.twitch.flushAt) <= Date.now()) {
+        state = (await this.safeFlushSnapshot(state, true)).state;
+      }
       if (!state.enabled) {
-        if (state.lastError?.startsWith("R2:") === true) {
+        if (state.lastError?.startsWith("R2:") === true && Date.parse(state.nextActionAt ?? "") <= Date.now()) {
           const flush = await this.safeFlushSnapshot(state, true);
           if (flush.success) {
             await this.ctx.storage.deleteAlarm();
@@ -130,6 +221,9 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         }
         return;
       }
+
+      // A Twitch flush alarm may fire earlier than YouTube's required polling interval.
+      if (Date.parse(state.nextActionAt ?? "") > Date.now()) return;
 
       try {
         if (state.liveChatId === null) {
@@ -174,9 +268,14 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       return this.statusFor(current);
     }
 
-    await this.archiveAndClearRun(current);
+    if (!current.twitch.enabled) await this.archiveAndClearRun(current);
 
     let next = createRunningState(channelRef, now);
+    next.twitch = current.twitch;
+    if (current.twitch.enabled) {
+      next.runId = current.runId;
+      next.startedAt = current.startedAt;
+    }
     this.saveState(next);
     await this.ctx.storage.setAlarm(Date.now());
     next = (await this.safeFlushSnapshot(next, true)).state;
@@ -231,7 +330,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       return this.statusFor(current);
     }
 
-    await this.archiveAndClearRun(current);
+    if (!current.twitch.enabled) await this.archiveAndClearRun(current);
 
     let next: RelayState = {
       ...createRunningState(channelRef, now),
@@ -242,7 +341,12 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       videoTitle: broadcast.title,
       liveChatId: broadcast.liveChatId,
       liveStartedAt: broadcast.actualStartTime,
+      twitch: current.twitch,
     };
+    if (current.twitch.enabled) {
+      next.runId = current.runId;
+      next.startedAt = current.startedAt;
+    }
     this.saveState(next);
     await this.ctx.storage.setAlarm(Date.now());
     next = (await this.safeFlushSnapshot(next, true)).state;
@@ -260,7 +364,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     let oldArchived = oldCommentCount === 0;
     if (oldCommentCount > 0) {
       const flush = await this.safeFlushSnapshot(state, true);
-      oldArchived = flush.success && flush.state.videoId !== null;
+      oldArchived = flush.success && (flush.state.videoId !== null || flush.state.twitch.channel !== null);
     }
 
     if (oldArchived) {
@@ -434,6 +538,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       const retryAt = fresh.enabled ? null : Date.now() + 30_000;
       const failed = {
         ...fresh,
+        twitch: { ...fresh.twitch, flushAt: fresh.twitch.flushAt === null ? null : new Date(Date.now() + 30_000).toISOString() },
         lastError: `R2: ${errorMessage(error)}`,
         updatedAt: new Date().toISOString(),
         nextActionAt:
@@ -500,7 +605,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     saveRelayState(this.ctx.storage, state);
   }
 
-  private runSerially<T>(operation: () => Promise<T> | T): Promise<T> {
+  private runSerially<T>(operation: () => Promise<T> | T, drainAll = false): Promise<T> {
     const previous = this.operationTail;
     let release: (() => void) | undefined;
     this.operationTail = new Promise<void>((resolve) => {
@@ -510,9 +615,24 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     return (async () => {
       await previous;
       try {
+        // Complete queued events before a control action can end or replace their session.
+        this.drainTwitch(drainAll);
         return await operation();
       } finally {
-        release?.();
+        try {
+          this.drainTwitch();
+          await this.ctx.storage.transaction(async (transaction) => {
+            const pending = this.ctx.storage.sql.exec("SELECT seq FROM twitch_pending LIMIT 1").toArray().length > 0;
+            const target = pending ? Date.now() : nextRelayAlarm(this.loadState());
+            if (target !== null) {
+              if (await transaction.getAlarm() !== target) await transaction.setAlarm(target);
+            } else {
+              await transaction.deleteAlarm();
+            }
+          });
+        } finally {
+          release?.();
+        }
       }
     })();
   }

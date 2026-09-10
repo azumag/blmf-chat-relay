@@ -2,6 +2,8 @@
 
 YouTube チャンネルを指定すると、現在アクティブなライブ配信を自動検出し、ライブチャットを Cloudflare R2 へ JSON 配列として定期保存する Cloudflare Workers アプリです。
 
+Twitch `azumagbanjo` のチャットも、同じJSON・差分APIに統合できます。管理画面で個別に開始・停止します。初回の認可・EventSub設定は [Twitch設定](docs/twitch.md) を参照してください。
+
 配信ID・動画ID・ライブチャットIDを運用時に入力する必要はありません。管理画面で「開始」を押した時間だけ動作し、配信終了を検出すると自動停止します。
 
 ## 主な機能

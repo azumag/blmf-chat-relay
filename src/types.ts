@@ -1,3 +1,5 @@
+import { createTwitchState, TWITCH_EVENT_TYPES, type TwitchState } from "./twitch";
+
 export type RelayPhase =
   | "stopped"
   | "discovering"
@@ -6,6 +8,7 @@ export type RelayPhase =
   | "error";
 
 export interface RelayState {
+  twitch: TwitchState;
   version: 1;
   enabled: boolean;
   runId: string;
@@ -69,6 +72,7 @@ export interface SimpleCommentDeltaResponse {
 }
 
 export interface RelayStatus {
+  twitch: Omit<TwitchState, "flushAt" | "subscriptions"> & { ready: boolean };
   enabled: boolean;
   phase: RelayPhase;
   channel: {
@@ -119,6 +123,7 @@ export interface RelayConfig {
 
 export function createStoppedState(now = new Date().toISOString()): RelayState {
   return {
+    twitch: createTwitchState(),
     version: 1,
     enabled: false,
     runId: crypto.randomUUID(),
@@ -195,7 +200,8 @@ export function buildPublicUrl(baseUrl: string, objectKey: string): string {
 
 export function archiveObjectKey(state: RelayState): string | null {
   if (state.videoId === null) {
-    return null;
+    return state.twitch.channel === null ? null :
+      `streams/twitch-${encodeURIComponent(state.twitch.channel)}/${encodeURIComponent(state.runId)}/comments.json`;
   }
 
   return `streams/${encodeURIComponent(state.videoId)}/comments.json`;
@@ -233,6 +239,16 @@ export function toRelayStatus(
   const archiveKey = archiveObjectKey(state);
 
   return {
+    twitch: {
+      enabled: state.twitch.enabled,
+      channel: state.twitch.channel,
+      broadcasterId: state.twitch.broadcasterId,
+      phase: state.twitch.phase,
+      startedAt: state.twitch.startedAt,
+      lastReceivedAt: state.twitch.lastReceivedAt,
+      lastError: state.twitch.lastError,
+      ready: TWITCH_EVENT_TYPES.every((type) => state.twitch.subscriptions[type] !== undefined),
+    },
     enabled: state.enabled,
     phase: state.phase,
     channel: {

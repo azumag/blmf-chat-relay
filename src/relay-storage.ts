@@ -13,6 +13,7 @@ import {
   normalizeDateTime,
   type LiveChatMessageItem,
 } from "./youtube";
+import type { TwitchDelivery } from "./twitch";
 
 interface StateRow {
   [key: string]: SqlStorageValue;
@@ -86,6 +87,23 @@ export function initializeRelayStorage(storage: DurableObjectStorage): void {
 
     CREATE INDEX IF NOT EXISTS comment_events_run_seq
       ON comment_events (run_id, seq);
+
+    CREATE TABLE IF NOT EXISTS twitch_receipts (
+      id TEXT PRIMARY KEY,
+      received_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS twitch_receipts_time ON twitch_receipts(received_at);
+    CREATE TABLE IF NOT EXISTS twitch_pending (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      delivery TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS twitch_moderation (
+      run_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      target TEXT NOT NULL,
+      deleted_at TEXT NOT NULL,
+      PRIMARY KEY (run_id, kind, target)
+    );
   `);
 
   const existing = storage.sql
@@ -362,6 +380,53 @@ export function deleteRunEvents(
   runId: string,
 ): void {
   storage.sql.exec("DELETE FROM comment_events WHERE run_id = ?", runId);
+  storage.sql.exec("DELETE FROM twitch_moderation WHERE run_id = ?", runId);
+}
+
+/** Must run in the same transaction as the durable enqueue and alarm writes. */
+export function acceptTwitchDelivery(storage: DurableObjectStorage, id: string, now = Date.now()): boolean {
+  storage.sql.exec("DELETE FROM twitch_receipts WHERE received_at < ?", now - 660_000);
+  if (storage.sql.exec("SELECT id FROM twitch_receipts WHERE id = ?", id).toArray().length) return false;
+  storage.sql.exec("INSERT INTO twitch_receipts (id, received_at) VALUES (?, ?)", id, now);
+  return true;
+}
+
+export function applyTwitchDelivery(storage: DurableObjectStorage, runId: string, delivery: TwitchDelivery): void {
+  const mutation = delivery.mutation;
+  if (!mutation) return;
+  const prefix = `twitch:${delivery.broadcasterId}:`;
+  const timestamp = delivery.timestamp;
+  if (mutation.kind === "message") {
+    // A delete may arrive before its message; receipts alone cannot prevent resurrection.
+    const blocked = storage.sql.exec(
+      `SELECT target FROM twitch_moderation WHERE run_id = ? AND
+       ((kind = 'delete' AND target = ?) OR (deleted_at >= ? AND
+       ((kind = 'clear-user' AND target = ?) OR (kind = 'clear' AND target = ?))))`,
+      runId, prefix + mutation.id, timestamp, prefix + mutation.authorId, prefix,
+    ).toArray().length > 0;
+    const id = prefix + mutation.id;
+    if (blocked || findStoredComment(storage, runId, id)) return;
+    applyChatItems(storage, runId, [{
+      id,
+      snippet: { publishedAt: timestamp, displayMessage: mutation.message },
+      authorDetails: { channelId: prefix + mutation.authorId, displayName: mutation.name },
+    }]);
+    return;
+  }
+  const target = prefix + (mutation.kind === "delete" ? mutation.id : mutation.kind === "clear-user" ? mutation.authorId : "");
+  storage.sql.exec(
+    `INSERT INTO twitch_moderation (run_id, kind, target, deleted_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (run_id, kind, target) DO UPDATE SET deleted_at = MAX(deleted_at, excluded.deleted_at)`,
+    runId, mutation.kind, target, timestamp,
+  );
+  const selection = mutation.kind === "delete" ? "id = ?" :
+    mutation.kind === "clear-user" ? "author_channel_id = ? AND created_at <= ?" : "substr(id, 1, ?) = ? AND created_at <= ?";
+  const bindings: SqlStorageValue[] = mutation.kind === "delete" ? [target] :
+    mutation.kind === "clear-user" ? [target, timestamp] : [prefix.length, prefix, timestamp];
+  const rows = storage.sql.exec<{ id: string }>(`SELECT id FROM comments WHERE run_id = ? AND ${selection}`, runId, ...bindings).toArray();
+  for (const row of rows) {
+    applyChatItems(storage, runId, [{ id: row.id, snippet: { type: "tombstone", publishedAt: timestamp } }]);
+  }
 }
 
 export function loadRelayState(

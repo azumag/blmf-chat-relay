@@ -1,5 +1,6 @@
 import { ADMIN_CSS, ADMIN_HTML, ADMIN_SCRIPT } from "./admin";
 import { isAuthorized } from "./auth";
+import { readTwitchDelivery, TwitchRequestError } from "./twitch";
 
 export { YouTubeChatRelay } from "./relay";
 
@@ -15,6 +16,21 @@ export default {
     const url = new URL(request.url);
 
     try {
+      if (url.pathname === "/api/twitch/eventsub") {
+        if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
+        const delivery = await readTwitchDelivery(request, env);
+        await env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME).receiveTwitch(delivery);
+        return delivery.challenge === null ? new Response(null, { status: 204 }) :
+          new Response(delivery.challenge, { headers: { "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": String(new TextEncoder().encode(delivery.challenge).length), "Cache-Control": "no-store" } });
+      }
+
+      if (request.method === "POST" && (url.pathname === "/api/twitch/start" || url.pathname === "/api/twitch/stop")) {
+        const unauthorized = await requireAuthorization(request, env);
+        if (unauthorized !== null) return unauthorized;
+        const relay = env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME);
+        return jsonResponse(url.pathname.endsWith("/start") ? await relay.startTwitch() : await relay.stopTwitch());
+      }
       if (request.method === "GET" && url.pathname === "/") {
         return Response.redirect(new URL("/admin", url).toString(), 302);
       }
@@ -167,6 +183,7 @@ export default {
 
       return errorResponse("Not Found", 404);
     } catch (error) {
+      if (error instanceof TwitchRequestError) return errorResponse(error.message, error.status);
       console.error(
         JSON.stringify({
           level: "error",

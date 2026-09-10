@@ -12,8 +12,8 @@ export const ADMIN_HTML = `<!doctype html>
     <header class="hero">
       <div>
         <p class="eyebrow">BLUEMOON WORKS</p>
-        <h1>YouTube コメントリレー</h1>
-        <p class="lead">チャンネルだけを指定して、現在のライブ配信を自動検出します。</p>
+        <h1>コメントリレー</h1>
+        <p class="lead">YouTubeとTwitchのコメントを、ひとつの一覧へ届けます。</p>
       </div>
       <div id="phaseBadge" class="badge" data-phase="stopped">停止中</div>
     </header>
@@ -44,8 +44,21 @@ export const ADMIN_HTML = `<!doctype html>
       </label>
 
       <div class="actions">
-        <button id="startButton" class="button button-primary" type="button">開始・再検出</button>
-        <button id="stopButton" class="button button-danger" type="button">停止</button>
+        <button id="startButton" class="button button-primary" type="button">YouTube 開始・再検出</button>
+        <button id="stopButton" class="button button-danger" type="button">YouTube 停止</button>
+      </div>
+
+      <div class="e2e-controls">
+        <h2>Twitch</h2>
+        <p id="twitchChannel">azumagbanjo</p>
+        <p id="twitchStatus" role="status">状態を確認中…</p>
+        <p id="twitchLastReceived" class="muted">最終受信: —</p>
+        <p id="twitchError" class="action-message"></p>
+        <div class="actions">
+          <button id="twitchStartButton" class="button button-primary" type="button">Twitch 開始</button>
+          <button id="twitchStopButton" class="button button-danger" type="button">Twitch 停止</button>
+        </div>
+        <p class="muted">YouTubeとは個別に開始・停止できます。初回はTwitchの接続設定が必要です。</p>
       </div>
 
       <div class="e2e-controls">
@@ -91,7 +104,7 @@ export const ADMIN_HTML = `<!doctype html>
     </section>
 
     <footer>
-      <span>Worker が有効な間だけ YouTube API を呼び出します。</span>
+      <span>Twitchのチャットは、配信がオフラインでも取得できます。</span>
       <a href="/health">health</a>
     </footer>
   </main>
@@ -261,6 +274,8 @@ export const ADMIN_SCRIPT = `(() => {
   const stopButton = byId("stopButton");
   const refreshButton = byId("refreshButton");
   const actionMessage = byId("actionMessage");
+  const twitchStartButton = byId("twitchStartButton");
+  const twitchStopButton = byId("twitchStopButton");
 
   const storedChannel = localStorage.getItem("blmfRelayChannel");
   if (storedChannel) channelInput.value = storedChannel;
@@ -316,7 +331,15 @@ export const ADMIN_SCRIPT = `(() => {
   function render(status) {
     const badge = byId("phaseBadge");
     badge.dataset.phase = status.phase;
-    badge.textContent = phaseLabel(status.phase);
+    badge.textContent = "YouTube: " + phaseLabel(status.phase);
+    const twitch = status.twitch;
+    if (twitch) {
+      byId("twitchChannel").textContent = twitch.channel || "azumagbanjo";
+      byId("twitchStatus").textContent = ({ stopped: "停止中", waiting: "接続設定を待機中",
+        running: "受信待機中", error: "接続エラー" })[twitch.phase] || twitch.phase;
+      byId("twitchLastReceived").textContent = "最終受信: " + formatDate(twitch.lastReceivedAt);
+      byId("twitchError").textContent = twitch.lastError || "";
+    }
 
     byId("channelStatus").textContent = status.channel.title
       ? status.channel.title + " (" + status.channel.id + ")"
@@ -374,6 +397,8 @@ export const ADMIN_SCRIPT = `(() => {
     }
 
     startButton.disabled = true;
+    twitchStartButton.disabled = true;
+    twitchStopButton.disabled = true;
     e2eStartButton.disabled = true;
     stopButton.disabled = true;
     actionMessage.textContent = "処理中…";
@@ -392,6 +417,8 @@ export const ADMIN_SCRIPT = `(() => {
       actionMessage.textContent = "操作に失敗しました: " + error.message;
     } finally {
       startButton.disabled = false;
+      twitchStartButton.disabled = false;
+      twitchStopButton.disabled = false;
       e2eStartButton.disabled = false;
       stopButton.disabled = false;
     }
@@ -415,8 +442,10 @@ export const ADMIN_SCRIPT = `(() => {
     );
   });
   stopButton.addEventListener("click", () => {
-    sendAction("/api/stop", {}, "停止しました。");
+    sendAction("/api/stop", {}, "YouTubeを停止しました。");
   });
+  twitchStartButton.addEventListener("click", () => sendAction("/api/twitch/start", {}, "Twitchの取得を有効にしました。接続状態を確認してください。"));
+  twitchStopButton.addEventListener("click", () => sendAction("/api/twitch/stop", {}, "Twitchを停止しました。"));
   refreshButton.addEventListener("click", () => refreshStatus(true));
   rememberInput.addEventListener("change", saveCredentials);
   tokenInput.addEventListener("change", saveCredentials);

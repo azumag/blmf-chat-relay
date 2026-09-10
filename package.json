@@ -13,10 +13,12 @@
     "types": "wrangler types",
     "typecheck": "npm run types && tsc --noEmit",
     "test": "vitest run",
+    "test:runtime": "wrangler deploy --dry-run --outdir .wrangler/test-bundle && node scripts/test-twitch-runtime.mjs",
     "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "miniflare": "5.20260820.0-alpha",
     "typescript": "7.0.2",
     "vitest": "4.1.11",
     "wrangler": "4.125.0"

@@ -20,6 +20,7 @@ export async function flushRelaySnapshot(
   const flushedAt = new Date().toISOString();
   const snapshotState: RelayState = {
     ...state,
+    twitch: { ...state.twitch, flushAt: null },
     lastFlushAt: flushedAt,
     updatedAt: flushedAt,
     lastError: state.lastError?.startsWith("R2:")
