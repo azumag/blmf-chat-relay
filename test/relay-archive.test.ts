@@ -144,6 +144,16 @@ describe("Twitch archive path (per-run archiveChannel)", () => {
     const afterV2Start = loadRelayState(storage);
     expect(afterV2Start.runId).not.toBe(runIdV1);
     expect(afterV2Start.videoId).toBeNull(); // fresh run, pre-discovery
+
+    // The fresh run must still have an archive path for the Twitch chat it keeps
+    // receiving: an earlier version of this fix tied archiveChannel to continuesRun,
+    // so a rolled-over run with Twitch still enabled got archiveChannel: null and lost
+    // its archive path (and, on the next roll, its comments) entirely.
+    expect(afterV2Start.archiveChannel).toBe("azumagbanjo");
+    await relay.receiveTwitch(delivery("channel.chat.message", "post-roll chat"));
+    const status = await relay.status();
+    expect(status.urls.archive).not.toBeNull();
+    expect(status.urls.archive).toContain("twitch-azumagbanjo");
   });
 });
 

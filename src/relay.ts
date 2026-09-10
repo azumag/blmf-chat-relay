@@ -83,14 +83,19 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       }
       const sameChannel = state.twitch.broadcasterId === config.broadcasterId;
       const subscriptions = sameChannel ? state.twitch.subscriptions : {};
-      // Don't clear lastError here: it would erase the only diagnostic (e.g. a
-      // revocation reason) the moment an operator clicks "start" to recover, even
-      // though nothing has actually been confirmed fixed yet. It's cleared once a
-      // fresh webhook_callback_verification actually confirms the subscriptions work.
+      // Clear lastError here UNLESS it's a live revocation (phase "error", the only
+      // place that phase is set): clicking "start" hasn't actually confirmed a
+      // revoked subscription is fixed, so erasing that diagnostic would be misleading.
+      // Any other lastError (e.g. a single dropped delivery logged by drainTwitch) is
+      // historical, not an ongoing condition, and would otherwise be stuck forever -
+      // the webhook_callback_verification path that also clears it only runs once all
+      // four subscriptions are confirmed, which a processing-failure alone won't cause.
+      const keepError = state.twitch.phase === "error";
       state = { ...state, archiveChannel: config.channel, twitch: { ...state.twitch, enabled: true,
         channel: config.channel, broadcasterId: config.broadcasterId, subscriptions,
         phase: TWITCH_EVENT_TYPES.every((type) => subscriptions[type]) ? "running" : "waiting",
         startedAt: state.twitch.enabled && sameChannel ? state.twitch.startedAt : new Date().toISOString(),
+        lastError: keepError ? state.twitch.lastError : null,
         lastReceivedAt: state.twitch.enabled && sameChannel ? state.twitch.lastReceivedAt : null,
       } };
       this.saveState(state);
@@ -195,6 +200,21 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       return false;
     }
     if (delivery.kind === "revocation") {
+      // Unlike a chat notification, a revocation is inherently about one specific
+      // subscription, and re-registering (scripts/twitch-setup.mjs) replaces the id for
+      // a type without removing the old one at Twitch's end - so a stale revocation for
+      // an already-superseded subscription can still arrive after a healthy new one is
+      // active. Require the id match here (accepting that a lost subscriptions map,
+      // per the comment above, would then also miss a genuine revocation - silent
+      // message loss is a better failure mode than a false, actively misleading error
+      // on an otherwise-healthy setup).
+      if (twitch.subscriptions[delivery.type] !== delivery.subscriptionId) {
+        this.log("twitch_revocation_unmatched", {
+          type: delivery.type,
+          subscriptionId: delivery.subscriptionId,
+        });
+        return false;
+      }
       delete twitch.subscriptions[delivery.type];
       twitch.phase = twitch.enabled ? "error" : "stopped";
       twitch.lastError = `Twitch: ${delivery.type} (${delivery.reason})。購読を再設定してください。`;
@@ -333,8 +353,13 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     if (continuesRun) {
       next.runId = current.runId;
       next.startedAt = current.startedAt;
-      next.archiveChannel = current.archiveChannel;
     }
+    // Independent of continuesRun: whether this (new or continued) run has Twitch
+    // archiving to do depends only on whether Twitch is currently enabled, not on
+    // whether it happens to be the same runId as before. Tying this to continuesRun
+    // left a freshly-rolled run with archiveChannel stuck at null while Twitch kept
+    // sending it messages, so it had no archive path at all until deleted unread.
+    next.archiveChannel = current.twitch.enabled ? current.twitch.channel : null;
     this.saveState(next);
     await this.ctx.storage.setAlarm(Date.now());
     next = (await this.safeFlushSnapshot(next, true)).state;
@@ -408,8 +433,12 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     if (continuesRun) {
       next.runId = current.runId;
       next.startedAt = current.startedAt;
-      next.archiveChannel = current.archiveChannel;
     }
+    // See startInternal: archiveChannel tracks whether Twitch is currently enabled,
+    // independent of continuesRun. Here videoId is already set, so archiveObjectKey()
+    // uses the video path regardless, but keep the field correct in case it ever
+    // doesn't (defense in depth, and consistency with startInternal).
+    next.archiveChannel = current.twitch.enabled ? current.twitch.channel : null;
     this.saveState(next);
     await this.ctx.storage.setAlarm(Date.now());
     next = (await this.safeFlushSnapshot(next, true)).state;
@@ -697,21 +726,31 @@ export class YouTubeChatRelay extends DurableObject<Env> {
           // twitch.flushAt), still reconcile so the alarm reflects it rather than the
           // immediate value receiveTwitch armed it to before the drain.
           if (!readOnly || drained) {
-            this.drainTwitch();
-            await this.ctx.storage.transaction(async (transaction) => {
-              const pending = this.ctx.storage.sql.exec("SELECT seq FROM twitch_pending LIMIT 1").toArray().length > 0;
-              const target = pending ? Date.now() : nextRelayAlarm(this.loadState());
-              if (target !== null) {
-                if (await transaction.getAlarm() !== target) await transaction.setAlarm(target);
-              } else {
-                // Safe only because nothing awaits between the SELECT above and this
-                // deleteAlarm(): a concurrent receiveTwitch() insert can only land fully
-                // before this synchronous block runs (pending would be true) or fully
-                // after (its own getAlarm()/setAlarm() then re-arms from null). Adding
-                // an await in this branch before deleteAlarm() would break that.
-                await transaction.deleteAlarm();
-              }
-            });
+            try {
+              this.drainTwitch();
+              await this.ctx.storage.transaction(async (transaction) => {
+                const pending = this.ctx.storage.sql.exec("SELECT seq FROM twitch_pending LIMIT 1").toArray().length > 0;
+                const target = pending ? Date.now() : nextRelayAlarm(this.loadState());
+                if (target !== null) {
+                  if (await transaction.getAlarm() !== target) await transaction.setAlarm(target);
+                } else {
+                  // Safe only because nothing awaits between the SELECT above and this
+                  // deleteAlarm(): a concurrent receiveTwitch() insert can only land
+                  // fully before this synchronous block runs (pending would be true) or
+                  // fully after (its own getAlarm()/setAlarm() then re-arms from null).
+                  // Adding an await in this branch before deleteAlarm() would break that.
+                  await transaction.deleteAlarm();
+                }
+              });
+            } catch (error) {
+              // Never let a reconciliation failure replace operation()'s own result or
+              // error (JS `finally` throwing does exactly that): the action it just
+              // took (e.g. startTwitch persisting enabled:true and flushing R2) already
+              // happened, so masking that success as a 500 - or masking the real cause
+              // of operation()'s own failure - would be strictly worse than a
+              // temporarily stale/immediate alarm that a later call still self-heals.
+              this.log("alarm_reconcile_error", { message: errorMessage(error) });
+            }
           }
         } finally {
           release?.();

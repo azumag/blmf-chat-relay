@@ -18,7 +18,7 @@ Twitch EventSub Webhookから受信し、YouTubeと同じ `comments.json`、`/ap
 - `POST /api/twitch/start` / `POST /api/twitch/stop` は既存の `Authorization: Bearer <ADMIN_TOKEN>` で操作します。チャンネルはWorker設定で固定します。
 - YouTubeの開始・停止は既存の `/api/start` / `/api/stop` です。状態APIの既存 `enabled` / `phase` はYouTubeを示し、新しい `twitch` オブジェクトがTwitchの状態を示します。どちらも有効なら同一の一覧に混在します。
 - YouTubeの終了・エラー・手動停止でもTwitchは継続します。Twitchはオフラインのチャットも受信するため、必要なタイミングで個別に停止してください。「停止」は保存を止めます。EventSub購読自体は残り、Twitchから通知は届きます。接続を完全に解除する場合はTwitchの購読を削除してください。
-- 両方が停止した後の新しい開始でセッションを切り替えます。片方が動作中に他方を開始した場合は同じセッションとコメントを保持します。Twitch単独のアーカイブは `streams/twitch-azumagbanjo/<runId>/comments.json`、YouTube併用時は既存の動画別アーカイブです。
+- 両方が停止した後の新しい開始でセッションを切り替えます。Twitchが動作中にYouTubeを開始した場合、そのセッションがまだ配信(videoId)を持っていなければ同じセッションとコメントを保持します。既に配信を終えたセッションであれば(Twitchを止めていなくても)新しいセッションになります。Twitch単独のアーカイブは `streams/twitch-azumagbanjo/<runId>/comments.json`、YouTube併用時は既存の動画別アーカイブです。
 - Twitchの `created_at` はEventSubメッセージのタイムスタンプです。イベントに投稿時刻フィールドがないため、厳密な投稿時刻ではありません。配信元フィールドは公開JSONへ追加していません。
 - Twitchの削除・投稿者ごとのクリア・全クリアはTwitchコメントだけを対象にし、差分には `delete` を追記します。遅れて到着した削除対象メッセージも復活させません。ただし判定はWebhookのタイムスタンプ同士の比較のため、初回配信に失敗し再送されたメッセージ（タイムスタンプが再送時刻に更新される）がクリアの後に届いた場合は、この限りではありません。該当メッセージのIDが分かれば `channel.chat.message_delete` の再送でタイムスタンプに関係なく永続的に抑制できます。
 - 通知は署名、時刻、購読種別、配信者を検証し、永続キューへの保存後に応答します。YouTube APIやR2の応答をWebhookが待つことはありません。重複通知は除外します。R2は設定された保存間隔で反映し、失敗時は再試行します。通知が1件だけでも反映されます。

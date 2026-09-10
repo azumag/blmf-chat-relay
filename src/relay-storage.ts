@@ -383,10 +383,21 @@ export function deleteRunEvents(
   storage.sql.exec("DELETE FROM twitch_moderation WHERE run_id = ?", runId);
 }
 
+// A retry gets a fresh Twitch-Eventsub-Message-Timestamp (see the comment in
+// applyTwitchDelivery below), so readTwitchDelivery's 10-minute freshness check bounds
+// each individual attempt's own latency, not how long the overall retry sequence can
+// run — that's undocumented by Twitch. Community-observed behavior is a handful of
+// attempts over a couple of minutes, but this window is kept an order of magnitude
+// larger than that (rather than matching the 10-minute freshness check) since an
+// under-sized window fails destructively: an id purged too early and then retried is
+// reprocessed, which is idempotent for a chat message but not for a clear (its
+// deleted_at only ever moves forward, permanently re-suppressing anything in between).
+const RECEIPT_RETENTION_MS = 3_600_000;
+
 /** Must run in the same transaction as the durable enqueue and alarm writes. */
 export function acceptTwitchDelivery(storage: DurableObjectStorage, id: string): boolean {
   const now = Date.now();
-  storage.sql.exec("DELETE FROM twitch_receipts WHERE received_at < ?", now - 660_000);
+  storage.sql.exec("DELETE FROM twitch_receipts WHERE received_at < ?", now - RECEIPT_RETENTION_MS);
   if (storage.sql.exec("SELECT id FROM twitch_receipts WHERE id = ?", id).toArray().length) return false;
   storage.sql.exec("INSERT INTO twitch_receipts (id, received_at) VALUES (?, ?)", id, now);
   return true;

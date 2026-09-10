@@ -125,8 +125,11 @@ export async function readTwitchDelivery(request: Request, env: Env): Promise<Tw
   let mutation: TwitchMutation | null = null;
   if (kind === "notification") {
     const event = object(body.event);
-    if (event.broadcaster_user_id !== config.broadcasterId ||
-        event.broadcaster_user_login !== config.channel) {
+    // Check only the immutable id, not broadcaster_user_login: a channel rename would
+    // otherwise 403 every notification (login still matches the id, just not the
+    // possibly-stale DEFAULT_TWITCH_CHANNEL config) until redeployed with the new
+    // login, and Twitch counts repeated failures toward revoking all four subscriptions.
+    if (event.broadcaster_user_id !== config.broadcasterId) {
       throw new TwitchRequestError("Unexpected Twitch channel", 403);
     }
     switch (type) {

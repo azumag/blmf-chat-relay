@@ -37,7 +37,7 @@ async function run() {
   let cursor;
   do {
     const page = await api(`eventsub/subscriptions${cursor ? `?after=${encodeURIComponent(cursor)}` : ""}`);
-    subscriptions.push(...page.data);
+    subscriptions.push(...(page.data ?? []));
     cursor = page.pagination?.cursor;
   } while (cursor);
   for (const type of types) {
