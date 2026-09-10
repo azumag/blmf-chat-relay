@@ -200,8 +200,9 @@ export function buildPublicUrl(baseUrl: string, objectKey: string): string {
 
 export function archiveObjectKey(state: RelayState): string | null {
   if (state.videoId === null) {
-    return state.twitch.channel === null ? null :
-      `streams/twitch-${encodeURIComponent(state.twitch.channel)}/${encodeURIComponent(state.runId)}/comments.json`;
+    return state.twitch.enabled && state.twitch.channel !== null
+      ? `streams/twitch-${encodeURIComponent(state.twitch.channel)}/${encodeURIComponent(state.runId)}/comments.json`
+      : null;
   }
 
   return `streams/${encodeURIComponent(state.videoId)}/comments.json`;

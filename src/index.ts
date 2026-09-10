@@ -1,6 +1,6 @@
 import { ADMIN_CSS, ADMIN_HTML, ADMIN_SCRIPT } from "./admin";
 import { isAuthorized } from "./auth";
-import { readTwitchDelivery, TwitchRequestError } from "./twitch";
+import { readTwitchDelivery, twitchConfig, TwitchRequestError } from "./twitch";
 
 export { YouTubeChatRelay } from "./relay";
 
@@ -28,8 +28,13 @@ export default {
       if (request.method === "POST" && (url.pathname === "/api/twitch/start" || url.pathname === "/api/twitch/stop")) {
         const unauthorized = await requireAuthorization(request, env);
         if (unauthorized !== null) return unauthorized;
+        const isStart = url.pathname.endsWith("/start");
+        // Validate here, not just inside the Durable Object: thrown errors crossing the
+        // RPC boundary lose their prototype chain, so `instanceof TwitchRequestError`
+        // below would not match an error thrown by relay.startTwitch() itself.
+        if (isStart) twitchConfig(env);
         const relay = env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME);
-        return jsonResponse(url.pathname.endsWith("/start") ? await relay.startTwitch() : await relay.stopTwitch());
+        return jsonResponse(isStart ? await relay.startTwitch() : await relay.stopTwitch());
       }
       if (request.method === "GET" && url.pathname === "/") {
         return Response.redirect(new URL("/admin", url).toString(), 302);
