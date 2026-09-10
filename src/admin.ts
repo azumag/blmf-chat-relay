@@ -50,7 +50,7 @@ export const ADMIN_HTML = `<!doctype html>
 
       <div class="e2e-controls">
         <h2>Twitch</h2>
-        <p id="twitchChannel">azumagbanjo</p>
+        <p id="twitchChannel">—</p>
         <p id="twitchStatus" role="status">状態を確認中…</p>
         <p id="twitchLastReceived" class="muted">最終受信: —</p>
         <p id="twitchError" class="action-message"></p>
@@ -334,7 +334,7 @@ export const ADMIN_SCRIPT = `(() => {
     badge.textContent = "YouTube: " + phaseLabel(status.phase);
     const twitch = status.twitch;
     if (twitch) {
-      byId("twitchChannel").textContent = twitch.channel || "azumagbanjo";
+      byId("twitchChannel").textContent = twitch.channel || "—";
       byId("twitchStatus").textContent = ({ stopped: "停止中", waiting: "接続設定を待機中",
         running: "受信待機中", error: "接続エラー" })[twitch.phase] || twitch.phase;
       byId("twitchLastReceived").textContent = "最終受信: " + formatDate(twitch.lastReceivedAt);

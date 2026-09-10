@@ -398,6 +398,11 @@ export function applyTwitchDelivery(storage: DurableObjectStorage, runId: string
   const timestamp = delivery.timestamp;
   if (mutation.kind === "message") {
     // A delete may arrive before its message; receipts alone cannot prevent resurrection.
+    // Known gap: `timestamp` is the EventSub delivery's own header timestamp, not a
+    // message-origin time (channel.chat.message carries no such field). A message whose
+    // first delivery attempt fails and is retried gets a fresh, later timestamp on
+    // success, so a clear that lands in the retry gap may not block it. Not fixable with
+    // the fields Twitch provides; see docs/twitch.md.
     const blocked = storage.sql.exec(
       `SELECT target FROM twitch_moderation WHERE run_id = ? AND
        ((kind = 'delete' AND target = ?) OR (deleted_at >= ? AND

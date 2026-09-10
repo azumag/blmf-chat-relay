@@ -17,12 +17,14 @@ export default {
 
     try {
       if (url.pathname === "/api/twitch/eventsub") {
-        if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
+        if (request.method !== "POST") {
+          return new Response(null, { status: 405, headers: secureHeaders({ Allow: "POST" }) });
+        }
         const delivery = await readTwitchDelivery(request, env);
         await env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME).receiveTwitch(delivery);
         return delivery.challenge === null ? new Response(null, { status: 204 }) :
-          new Response(delivery.challenge, { headers: { "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": String(new TextEncoder().encode(delivery.challenge).length), "Cache-Control": "no-store" } });
+          new Response(delivery.challenge, { headers: secureHeaders({ "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": String(new TextEncoder().encode(delivery.challenge).length), "Cache-Control": "no-store" }) });
       }
 
       if (request.method === "POST" && (url.pathname === "/api/twitch/start" || url.pathname === "/api/twitch/stop")) {

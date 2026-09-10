@@ -23,6 +23,7 @@ import {
   saveRelayState,
 } from "./relay-storage";
 import {
+  archiveObjectKey,
   createRunningState,
   readRelayConfig,
   toRelayStatus,
@@ -82,7 +83,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       }
       const sameChannel = state.twitch.broadcasterId === config.broadcasterId;
       const subscriptions = sameChannel ? state.twitch.subscriptions : {};
-      state = { ...state, twitch: { ...state.twitch, enabled: true,
+      state = { ...state, archiveChannel: config.channel, twitch: { ...state.twitch, enabled: true,
         channel: config.channel, broadcasterId: config.broadcasterId, subscriptions,
         phase: TWITCH_EVENT_TYPES.every((type) => subscriptions[type]) ? "running" : "waiting",
         startedAt: state.twitch.enabled && sameChannel ? state.twitch.startedAt : new Date().toISOString(),
@@ -117,42 +118,78 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       const pending = this.ctx.storage.sql.exec<{ seq: number; delivery: string }>(
         "SELECT seq, delivery FROM twitch_pending ORDER BY seq LIMIT ?", all ? -1 : 200,
       ).toArray();
+      if (pending.length === 0) return;
+
+      // Load/save once per batch, not per row: nothing else can observe or mutate
+      // relay_state between iterations (single-threaded, no awaits in this function),
+      // so accumulating onto one in-memory copy is equivalent to the original
+      // reload-after-every-save, minus up to 199 redundant round trips per drain.
+      const state = this.loadState();
+      const twitch = { ...state.twitch, subscriptions: { ...state.twitch.subscriptions } };
+      let dirty = false;
       for (const row of pending) {
-        const delivery = JSON.parse(row.delivery) as TwitchDelivery;
+        // Delete before processing, and keep failures scoped to this row: drainTwitch
+        // runs at the start of every runSerially() call (status, deltas, start/stop,
+        // alarm), so one throwing delivery must not roll back this whole batch's
+        // deletes and permanently wedge every future call on the same poison pill.
         this.ctx.storage.sql.exec("DELETE FROM twitch_pending WHERE seq = ?", row.seq);
-        let state = this.loadState();
-        const twitch = { ...state.twitch, subscriptions: { ...state.twitch.subscriptions } };
-        if (delivery.kind === "webhook_callback_verification") {
-          if (twitch.broadcasterId !== delivery.broadcasterId) twitch.subscriptions = {};
-          twitch.broadcasterId = delivery.broadcasterId;
-          twitch.channel = this.env.DEFAULT_TWITCH_CHANNEL.trim().toLowerCase();
-          twitch.subscriptions[delivery.type] = delivery.subscriptionId;
-          if (twitch.enabled && TWITCH_EVENT_TYPES.every((type) => twitch.subscriptions[type])) {
-            twitch.phase = "running";
-            twitch.lastError = null;
+        try {
+          if (this.applyPendingTwitchDelivery(state, twitch, JSON.parse(row.delivery) as TwitchDelivery)) {
+            dirty = true;
           }
-        } else {
-          if (twitch.broadcasterId !== delivery.broadcasterId ||
-              twitch.subscriptions[delivery.type] !== delivery.subscriptionId) continue;
-          if (delivery.kind === "revocation") {
-            delete twitch.subscriptions[delivery.type];
-            twitch.phase = twitch.enabled ? "error" : "stopped";
-            twitch.lastError = `Twitch: ${delivery.type} (${delivery.reason})。購読を再設定してください。`;
-          } else {
-            if (!twitch.enabled || Date.parse(delivery.timestamp) < Date.parse(twitch.startedAt ?? "")) continue;
-            applyTwitchDelivery(this.ctx.storage, state.runId, delivery);
-            twitch.lastReceivedAt = new Date().toISOString();
-          }
+        } catch (error) {
+          this.log("twitch_delivery_dropped", { seq: row.seq, message: errorMessage(error) });
         }
-        // Registering webhooks before the first session must not replace the pre-live R2 snapshot.
-        if (state.startedAt !== null) {
-          twitch.flushAt ??= new Date(Math.max(Date.now(),
-            (Date.parse(state.lastFlushAt ?? "") || 0) + readRelayConfig(this.env).r2FlushIntervalMs)).toISOString();
-        }
-        state = { ...state, twitch, updatedAt: new Date().toISOString() };
-        this.saveState(state);
       }
+      if (!dirty) return;
+      // Registering webhooks before the first session must not replace the pre-live R2 snapshot.
+      if (state.startedAt !== null) {
+        twitch.flushAt ??= new Date(Math.max(Date.now(),
+          (Date.parse(state.lastFlushAt ?? "") || 0) + readRelayConfig(this.env).r2FlushIntervalMs)).toISOString();
+      }
+      this.saveState({ ...state, twitch, updatedAt: new Date().toISOString() });
     });
+  }
+
+  /** Mutates `twitch` in place; returns whether it applied a change worth persisting. */
+  private applyPendingTwitchDelivery(
+    state: RelayState,
+    twitch: RelayState["twitch"],
+    delivery: TwitchDelivery,
+  ): boolean {
+    if (delivery.kind === "webhook_callback_verification") {
+      if (twitch.broadcasterId !== delivery.broadcasterId) twitch.subscriptions = {};
+      twitch.broadcasterId = delivery.broadcasterId;
+      twitch.channel = twitchConfig(this.env).channel;
+      twitch.subscriptions[delivery.type] = delivery.subscriptionId;
+      if (twitch.enabled && TWITCH_EVENT_TYPES.every((type) => twitch.subscriptions[type])) {
+        twitch.phase = "running";
+        twitch.lastError = null;
+      }
+      return true;
+    }
+    if (twitch.broadcasterId !== delivery.broadcasterId ||
+        twitch.subscriptions[delivery.type] !== delivery.subscriptionId) {
+      // A verified notification we can't match to a known subscription (e.g. the
+      // subscriptions map was lost to a state reset) is otherwise silently dropped
+      // forever with no signal in the admin UI. At least log it for diagnosis.
+      this.log("twitch_notification_unmatched", {
+        kind: delivery.kind,
+        type: delivery.type,
+        subscriptionId: delivery.subscriptionId,
+      });
+      return false;
+    }
+    if (delivery.kind === "revocation") {
+      delete twitch.subscriptions[delivery.type];
+      twitch.phase = twitch.enabled ? "error" : "stopped";
+      twitch.lastError = `Twitch: ${delivery.type} (${delivery.reason})。購読を再設定してください。`;
+      return true;
+    }
+    if (!twitch.enabled || Date.parse(delivery.timestamp) < Date.parse(twitch.startedAt ?? "")) return false;
+    applyTwitchDelivery(this.ctx.storage, state.runId, delivery);
+    twitch.lastReceivedAt = new Date().toISOString();
+    return true;
   }
 
   async commentsDelta(
@@ -275,6 +312,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     if (current.twitch.enabled) {
       next.runId = current.runId;
       next.startedAt = current.startedAt;
+      next.archiveChannel = current.archiveChannel;
     }
     this.saveState(next);
     await this.ctx.storage.setAlarm(Date.now());
@@ -346,6 +384,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     if (current.twitch.enabled) {
       next.runId = current.runId;
       next.startedAt = current.startedAt;
+      next.archiveChannel = current.archiveChannel;
     }
     this.saveState(next);
     await this.ctx.storage.setAlarm(Date.now());
@@ -364,7 +403,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     let oldArchived = oldCommentCount === 0;
     if (oldCommentCount > 0) {
       const flush = await this.safeFlushSnapshot(state, true);
-      oldArchived = flush.success && (flush.state.videoId !== null || flush.state.twitch.channel !== null);
+      oldArchived = flush.success && archiveObjectKey(flush.state) !== null;
     }
 
     if (oldArchived) {
@@ -627,6 +666,11 @@ export class YouTubeChatRelay extends DurableObject<Env> {
             if (target !== null) {
               if (await transaction.getAlarm() !== target) await transaction.setAlarm(target);
             } else {
+              // Safe only because nothing awaits between the SELECT above and this
+              // deleteAlarm(): a concurrent receiveTwitch() insert can only land fully
+              // before this synchronous block runs (pending would be true) or fully
+              // after (its own getAlarm()/setAlarm() then re-arms from null). Adding
+              // an await in this branch before deleteAlarm() would break that.
               await transaction.deleteAlarm();
             }
           });
