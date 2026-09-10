@@ -60,7 +60,8 @@ export function twitchConfig(env: Env) {
 }
 
 // Read a bounded raw body: HMAC must cover the exact bytes, before parsing JSON.
-export async function readTwitchDelivery(request: Request, env: Env, now = Date.now()): Promise<TwitchDelivery> {
+export async function readTwitchDelivery(request: Request, env: Env): Promise<TwitchDelivery> {
+  const now = Date.now();
   const config = twitchConfig(env);
   const id = request.headers.get("Twitch-Eventsub-Message-Id") ?? "";
   const timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp") ?? "";

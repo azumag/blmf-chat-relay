@@ -1,6 +1,8 @@
 // Operator-only setup. Never prints tokens, secrets, or raw API responses.
 const types = ["channel.chat.message", "channel.chat.message_delete", "channel.chat.clear_user_messages", "channel.chat.clear"];
 const mode = process.argv[2] ?? "inspect";
+// Matches wrangler.jsonc's DEFAULT_TWITCH_CHANNEL default (docs/twitch.md step 3 keeps
+// it as-is); set DEFAULT_TWITCH_CHANNEL locally if a fork changes that default.
 const channel = process.env.DEFAULT_TWITCH_CHANNEL || "azumagbanjo";
 const required = (name) => {
   const value = process.env[name];

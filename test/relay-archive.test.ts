@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TWITCH_EVENT_TYPES, type TwitchDelivery, type TwitchEventType } from "../src/twitch";
+import { loadRelayState, saveRelayState } from "../src/relay-storage";
 
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
@@ -115,6 +116,34 @@ describe("Twitch archive path (per-run archiveChannel)", () => {
     await relay.start("@some-channel");
     const status = await relay.status();
     expect(status.urls.archive).toBeNull();
+  });
+
+  it("rolls to a fresh run for each new YouTube broadcast, even while Twitch stays on", async () => {
+    const { relay, storage } = fixture();
+
+    await relay.startTwitch();
+    await register(relay);
+    await relay.receiveTwitch(delivery("channel.chat.message", "twitch-only chat"));
+
+    // Simulate YouTube having discovered and run broadcast V1 under the current run
+    // (normally set by discoverBroadcast()/pollLiveChat() during alarm()).
+    const beforeV1 = loadRelayState(storage);
+    saveRelayState(storage, { ...beforeV1, enabled: true, videoId: "V1", phase: "running" });
+    const runIdV1 = loadRelayState(storage).runId;
+
+    // The broadcast ends; Twitch is left running, per the documented "Twitch outlives
+    // YouTube" behavior.
+    await relay.stop("manual");
+    expect(loadRelayState(storage).twitch.enabled).toBe(true);
+    expect(loadRelayState(storage).videoId).toBe("V1"); // stop() never clears videoId
+
+    // A later, separate broadcast starts. Before this fix, current.twitch.enabled
+    // alone decided whether to continue the old run, so this would keep runId/videoId
+    // "V1"'s SQLite comments and merge V2's into the same archive forever.
+    await relay.start("@example");
+    const afterV2Start = loadRelayState(storage);
+    expect(afterV2Start.runId).not.toBe(runIdV1);
+    expect(afterV2Start.videoId).toBeNull(); // fresh run, pre-discovery
   });
 });
 

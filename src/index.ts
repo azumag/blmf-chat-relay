@@ -22,7 +22,7 @@ export default {
         }
         const delivery = await readTwitchDelivery(request, env);
         await env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME).receiveTwitch(delivery);
-        return delivery.challenge === null ? new Response(null, { status: 204 }) :
+        return delivery.challenge === null ? new Response(null, { status: 204, headers: secureHeaders({}) }) :
           new Response(delivery.challenge, { headers: secureHeaders({ "Content-Type": "text/plain; charset=utf-8",
             "Content-Length": String(new TextEncoder().encode(delivery.challenge).length), "Cache-Control": "no-store" }) });
       }

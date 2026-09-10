@@ -384,7 +384,8 @@ export function deleteRunEvents(
 }
 
 /** Must run in the same transaction as the durable enqueue and alarm writes. */
-export function acceptTwitchDelivery(storage: DurableObjectStorage, id: string, now = Date.now()): boolean {
+export function acceptTwitchDelivery(storage: DurableObjectStorage, id: string): boolean {
+  const now = Date.now();
   storage.sql.exec("DELETE FROM twitch_receipts WHERE received_at < ?", now - 660_000);
   if (storage.sql.exec("SELECT id FROM twitch_receipts WHERE id = ?", id).toArray().length) return false;
   storage.sql.exec("INSERT INTO twitch_receipts (id, received_at) VALUES (?, ?)", id, now);
@@ -401,8 +402,11 @@ export function applyTwitchDelivery(storage: DurableObjectStorage, runId: string
     // Known gap: `timestamp` is the EventSub delivery's own header timestamp, not a
     // message-origin time (channel.chat.message carries no such field). A message whose
     // first delivery attempt fails and is retried gets a fresh, later timestamp on
-    // success, so a clear that lands in the retry gap may not block it. Not fixable with
-    // the fields Twitch provides; see docs/twitch.md.
+    // success, so a clear that lands in the retry gap may not block it. Twitch-Eventsub-
+    // Message-Retry (not currently read) would say "this is a retry" but still can't
+    // recover the true origin time, so it can't fix the check itself; see docs/twitch.md
+    // for the operator remedy (a targeted message_delete permanently suppresses by id,
+    // with no timestamp condition).
     const blocked = storage.sql.exec(
       `SELECT target FROM twitch_moderation WHERE run_id = ? AND
        ((kind = 'delete' AND target = ?) OR (deleted_at >= ? AND

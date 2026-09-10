@@ -57,19 +57,19 @@ export class YouTubeChatRelay extends DurableObject<Env> {
   }
 
   async start(channelRef: string): Promise<RelayStatus> {
-    return this.runSerially(() => this.startInternal(channelRef), true);
+    return this.runSerially(() => this.startInternal(channelRef), { drainAll: true });
   }
 
   async startE2E(channelRef: string, videoId: string): Promise<RelayStatus> {
-    return this.runSerially(() => this.startE2EInternal(channelRef, videoId), true);
+    return this.runSerially(() => this.startE2EInternal(channelRef, videoId), { drainAll: true });
   }
 
   async stop(reason = "manual"): Promise<RelayStatus> {
-    return this.runSerially(() => this.stopInternal(reason), true);
+    return this.runSerially(() => this.stopInternal(reason), { drainAll: true });
   }
 
   async status(): Promise<RelayStatus> {
-    return this.runSerially(() => this.currentStatus());
+    return this.runSerially(() => this.currentStatus(), { readOnly: true });
   }
 
   async startTwitch(): Promise<RelayStatus> {
@@ -83,15 +83,19 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       }
       const sameChannel = state.twitch.broadcasterId === config.broadcasterId;
       const subscriptions = sameChannel ? state.twitch.subscriptions : {};
+      // Don't clear lastError here: it would erase the only diagnostic (e.g. a
+      // revocation reason) the moment an operator clicks "start" to recover, even
+      // though nothing has actually been confirmed fixed yet. It's cleared once a
+      // fresh webhook_callback_verification actually confirms the subscriptions work.
       state = { ...state, archiveChannel: config.channel, twitch: { ...state.twitch, enabled: true,
         channel: config.channel, broadcasterId: config.broadcasterId, subscriptions,
         phase: TWITCH_EVENT_TYPES.every((type) => subscriptions[type]) ? "running" : "waiting",
         startedAt: state.twitch.enabled && sameChannel ? state.twitch.startedAt : new Date().toISOString(),
-        lastError: null, lastReceivedAt: state.twitch.enabled && sameChannel ? state.twitch.lastReceivedAt : null,
+        lastReceivedAt: state.twitch.enabled && sameChannel ? state.twitch.lastReceivedAt : null,
       } };
       this.saveState(state);
       return this.statusFor((await this.safeFlushSnapshot(state, true)).state);
-    }, true);
+    }, { drainAll: true });
   }
 
   async stopTwitch(): Promise<RelayStatus> {
@@ -100,7 +104,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       const stopped: RelayState = { ...state, twitch: { ...state.twitch, enabled: false, phase: "stopped" } };
       this.saveState(stopped);
       return this.statusFor((await this.safeFlushSnapshot(stopped, true)).state);
-    }, true);
+    }, { drainAll: true });
   }
 
   async receiveTwitch(delivery: TwitchDelivery): Promise<void> {
@@ -113,12 +117,13 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     });
   }
 
-  private drainTwitch(all = false): void {
-    this.ctx.storage.transactionSync(() => {
+  /** Returns whether any pending delivery was applied (i.e. relay_state changed). */
+  private drainTwitch(all = false): boolean {
+    return this.ctx.storage.transactionSync(() => {
       const pending = this.ctx.storage.sql.exec<{ seq: number; delivery: string }>(
         "SELECT seq, delivery FROM twitch_pending ORDER BY seq LIMIT ?", all ? -1 : 200,
       ).toArray();
-      if (pending.length === 0) return;
+      if (pending.length === 0) return false;
 
       // Load/save once per batch, not per row: nothing else can observe or mutate
       // relay_state between iterations (single-threaded, no awaits in this function),
@@ -138,16 +143,21 @@ export class YouTubeChatRelay extends DurableObject<Env> {
             dirty = true;
           }
         } catch (error) {
+          // Surface this beyond the log: otherwise the admin UI keeps showing "running"
+          // while a delivery is silently and permanently discarded.
+          twitch.lastError = `Twitch: 通知の処理に失敗しました (${errorMessage(error)})`;
+          dirty = true;
           this.log("twitch_delivery_dropped", { seq: row.seq, message: errorMessage(error) });
         }
       }
-      if (!dirty) return;
+      if (!dirty) return false;
       // Registering webhooks before the first session must not replace the pre-live R2 snapshot.
       if (state.startedAt !== null) {
         twitch.flushAt ??= new Date(Math.max(Date.now(),
           (Date.parse(state.lastFlushAt ?? "") || 0) + readRelayConfig(this.env).r2FlushIntervalMs)).toISOString();
       }
       this.saveState({ ...state, twitch, updatedAt: new Date().toISOString() });
+      return true;
     });
   }
 
@@ -168,11 +178,15 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       }
       return true;
     }
-    if (twitch.broadcasterId !== delivery.broadcasterId ||
-        twitch.subscriptions[delivery.type] !== delivery.subscriptionId) {
-      // A verified notification we can't match to a known subscription (e.g. the
-      // subscriptions map was lost to a state reset) is otherwise silently dropped
-      // forever with no signal in the admin UI. At least log it for diagnosis.
+    if (twitch.broadcasterId !== delivery.broadcasterId) {
+      // broadcasterId is the authorization-relevant check here, and readTwitchDelivery
+      // already verified it (HMAC + subscription condition) against the currently
+      // configured broadcaster before this delivery was ever enqueued. Deliberately NOT
+      // also requiring subscriptions[type] === delivery.subscriptionId: that map is only
+      // ever populated by webhook_callback_verification, so losing it (e.g. a
+      // loadRelayState parse-error fallback) would otherwise silently and permanently
+      // drop every future, correctly-authenticated notification with no way to recover
+      // short of deleting and recreating the Twitch subscriptions.
       this.log("twitch_notification_unmatched", {
         kind: delivery.kind,
         type: delivery.type,
@@ -206,7 +220,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         after,
         limit,
       );
-    });
+    }, { readOnly: true });
   }
 
   async commentsDeltaSimple(
@@ -240,7 +254,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         });
         return delta;
       }
-    });
+    }, { readOnly: true });
   }
 
   override async alarm(): Promise<void> {
@@ -305,11 +319,18 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       return this.statusFor(current);
     }
 
-    if (!current.twitch.enabled) await this.archiveAndClearRun(current);
+    // Continue the same run only if Twitch is actively sharing it AND it hasn't
+    // already carried a finished YouTube broadcast (current.videoId === null): once a
+    // broadcast has used this run, a later start() is for a *new* broadcast, even if
+    // Twitch never stopped in between. Otherwise every later stream would append to
+    // the same runId/archive forever as long as Twitch stayed on (the documented,
+    // ordinary way to run this relay), merging unrelated broadcasts' comments.
+    const continuesRun = current.twitch.enabled && current.videoId === null;
+    if (!continuesRun) await this.archiveAndClearRun(current);
 
     let next = createRunningState(channelRef, now);
     next.twitch = current.twitch;
-    if (current.twitch.enabled) {
+    if (continuesRun) {
       next.runId = current.runId;
       next.startedAt = current.startedAt;
       next.archiveChannel = current.archiveChannel;
@@ -368,7 +389,10 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       return this.statusFor(current);
     }
 
-    if (!current.twitch.enabled) await this.archiveAndClearRun(current);
+    // See startInternal's continuesRun comment: only merge into the existing run if
+    // it hasn't already carried a finished broadcast.
+    const continuesRun = current.twitch.enabled && current.videoId === null;
+    if (!continuesRun) await this.archiveAndClearRun(current);
 
     let next: RelayState = {
       ...createRunningState(channelRef, now),
@@ -381,7 +405,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       liveStartedAt: broadcast.actualStartTime,
       twitch: current.twitch,
     };
-    if (current.twitch.enabled) {
+    if (continuesRun) {
       next.runId = current.runId;
       next.startedAt = current.startedAt;
       next.archiveChannel = current.archiveChannel;
@@ -644,7 +668,11 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     saveRelayState(this.ctx.storage, state);
   }
 
-  private runSerially<T>(operation: () => Promise<T> | T, drainAll = false): Promise<T> {
+  private runSerially<T>(
+    operation: () => Promise<T> | T,
+    options: { drainAll?: boolean; readOnly?: boolean } = {},
+  ): Promise<T> {
+    const { drainAll = false, readOnly = false } = options;
     const previous = this.operationTail;
     let release: (() => void) | undefined;
     this.operationTail = new Promise<void>((resolve) => {
@@ -653,27 +681,38 @@ export class YouTubeChatRelay extends DurableObject<Env> {
 
     return (async () => {
       await previous;
+      let drained = false;
       try {
         // Complete queued events before a control action can end or replace their session.
-        this.drainTwitch(drainAll);
+        drained = this.drainTwitch(drainAll);
         return await operation();
       } finally {
         try {
-          this.drainTwitch();
-          await this.ctx.storage.transaction(async (transaction) => {
-            const pending = this.ctx.storage.sql.exec("SELECT seq FROM twitch_pending LIMIT 1").toArray().length > 0;
-            const target = pending ? Date.now() : nextRelayAlarm(this.loadState());
-            if (target !== null) {
-              if (await transaction.getAlarm() !== target) await transaction.setAlarm(target);
-            } else {
-              // Safe only because nothing awaits between the SELECT above and this
-              // deleteAlarm(): a concurrent receiveTwitch() insert can only land fully
-              // before this synchronous block runs (pending would be true) or fully
-              // after (its own getAlarm()/setAlarm() then re-arms from null). Adding
-              // an await in this branch before deleteAlarm() would break that.
-              await transaction.deleteAlarm();
-            }
-          });
+          // Read-only callers (status, delta) never mutate anything the alarm target
+          // depends on, and receiveTwitch() already arms its own alarm independently of
+          // this reconciliation — so on a truly idle poll (nothing was pending above),
+          // skip re-draining and rewriting the alarm. This avoids an unconditional
+          // deleteAlarm() write on every call to the unauthenticated delta endpoints
+          // while idle. If something *was* drained above (e.g. a message that just set
+          // twitch.flushAt), still reconcile so the alarm reflects it rather than the
+          // immediate value receiveTwitch armed it to before the drain.
+          if (!readOnly || drained) {
+            this.drainTwitch();
+            await this.ctx.storage.transaction(async (transaction) => {
+              const pending = this.ctx.storage.sql.exec("SELECT seq FROM twitch_pending LIMIT 1").toArray().length > 0;
+              const target = pending ? Date.now() : nextRelayAlarm(this.loadState());
+              if (target !== null) {
+                if (await transaction.getAlarm() !== target) await transaction.setAlarm(target);
+              } else {
+                // Safe only because nothing awaits between the SELECT above and this
+                // deleteAlarm(): a concurrent receiveTwitch() insert can only land fully
+                // before this synchronous block runs (pending would be true) or fully
+                // after (its own getAlarm()/setAlarm() then re-arms from null). Adding
+                // an await in this branch before deleteAlarm() would break that.
+                await transaction.deleteAlarm();
+              }
+            });
+          }
         } finally {
           release?.();
         }
