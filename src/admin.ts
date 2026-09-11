@@ -58,7 +58,7 @@ export const ADMIN_HTML = `<!doctype html>
           <button id="twitchStartButton" class="button button-primary" type="button">Twitch 開始</button>
           <button id="twitchStopButton" class="button button-danger" type="button">Twitch 停止</button>
         </div>
-        <p class="muted">YouTubeとは個別に開始・停止できます。初回はTwitchの接続設定が必要です。</p>
+        <p class="muted">YouTubeとは個別に開始・停止できます。Twitchは匿名IRCで接続するため、Twitch側の認証設定は不要です。</p>
       </div>
 
       <div class="e2e-controls">
@@ -335,7 +335,7 @@ export const ADMIN_SCRIPT = `(() => {
     const twitch = status.twitch;
     if (twitch) {
       byId("twitchChannel").textContent = twitch.channel || "—";
-      byId("twitchStatus").textContent = ({ stopped: "停止中", waiting: "接続設定を待機中",
+      byId("twitchStatus").textContent = ({ stopped: "停止中", waiting: "IRC参加待機中",
         running: "受信待機中", error: "接続エラー" })[twitch.phase] || twitch.phase;
       byId("twitchLastReceived").textContent = "最終受信: " + formatDate(twitch.lastReceivedAt);
       byId("twitchError").textContent = twitch.lastError || "";
