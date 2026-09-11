@@ -11,15 +11,17 @@ export interface TwitchState {
   enabled: boolean;
   channel: string | null;
   /**
-   * Kept for storage/output compatibility with the previous EventSub transport.
-   * IRC uses the normalized channel login as the stable source namespace.
+   * Stable source namespace used by persisted Twitch comment IDs. EventSub used the
+   * numeric broadcaster id; IRC-only fresh installs use the normalized channel login.
+   * Keeping an existing value for the same channel lets an in-place EventSub -> IRC
+   * deployment continue to delete/moderate comments already stored in the active run.
    */
   broadcasterId: string | null;
   phase: "stopped" | "waiting" | "running" | "error";
   startedAt: string | null;
   lastReceivedAt: string | null;
   lastError: string | null;
-  /** Legacy EventSub field; retained so old persisted state remains readable. */
+  /** Legacy EventSub field retained for storage/status compatibility. */
   subscriptions: Partial<Record<TwitchEventType, string>>;
   flushAt: string | null;
   /** Next allowed IRC reconnect attempt. Missing in legacy persisted state. */
@@ -49,8 +51,7 @@ export type TwitchMutation =
 
 /**
  * Transport-neutral queue payload. The shape intentionally stays close to the old
- * EventSub delivery so existing durable queue/storage code can be reused during the
- * transport migration.
+ * EventSub delivery so the durable queue/storage layer can be reused unchanged.
  */
 export interface TwitchDelivery {
   id: string;
@@ -67,7 +68,7 @@ export interface TwitchDelivery {
 export type TwitchIrcEvent =
   | { kind: "ping"; payload: string; channel: null }
   | { kind: "reconnect" }
-  | { kind: "activity"; channel: string | null }
+  | { kind: "activity"; channel: string | null; confirmsJoin: boolean }
   | { kind: "notice"; channel: string | null; code: string | null; message: string }
   | { kind: "delivery"; delivery: TwitchDelivery };
 
@@ -96,6 +97,27 @@ export function shouldAttemptTwitchReconnect(
 ): boolean {
   const reconnectAt = Date.parse(state.reconnectAt ?? "");
   return !Number.isFinite(reconnectAt) || reconnectAt <= now;
+}
+
+/** Preserve the pre-migration numeric EventSub namespace while the channel is unchanged. */
+export function twitchSourceNamespace(state: TwitchState, channel: string): string {
+  if (
+    state.channel === channel &&
+    typeof state.broadcasterId === "string" &&
+    state.broadcasterId !== ""
+  ) {
+    return state.broadcasterId;
+  }
+  return channel;
+}
+
+export function withTwitchNamespace(
+  delivery: TwitchDelivery,
+  broadcasterId: string,
+): TwitchDelivery {
+  return delivery.broadcasterId === broadcasterId
+    ? delivery
+    : { ...delivery, broadcasterId };
 }
 
 export function createGuestNick(random: () => number = Math.random): string {
@@ -175,15 +197,20 @@ function parseIrcLine(rawLine: string, now: () => number): TwitchIrcEvent | null
     };
   }
 
-  if (command === "ROOMSTATE" || command === "JOIN" || /^\d{3}$/.test(command)) {
-    return { kind: "activity", channel: channel || null };
+  // 001 only proves the IRC session authenticated. A channel-specific JOIN/ROOMSTATE
+  // (or an actual PRIVMSG below) is required before the relay reports `running`.
+  if (command === "ROOMSTATE" || command === "JOIN") {
+    return { kind: "activity", channel: channel || null, confirmsJoin: channel !== "" };
+  }
+  if (/^\d{3}$/.test(command)) {
+    return { kind: "activity", channel: channel || null, confirmsJoin: false };
   }
 
   if (channel === "") return null;
   if (command === "PRIVMSG") return parsePrivmsg(line, channel, now);
   if (command === "CLEARMSG") return parseClearmsg(line, channel, now);
   if (command === "CLEARCHAT") return parseClearchat(line, channel, now);
-  return { kind: "activity", channel };
+  return { kind: "activity", channel, confirmsJoin: false };
 }
 
 function parsePrivmsg(
