@@ -1,5 +1,2 @@
 YOUTUBE_API_KEY="replace-with-youtube-data-api-key"
 ADMIN_TOKEN="replace-with-a-long-random-token"
-TWITCH_EVENTSUB_SECRET="replace-with-a-random-eventsub-secret"
-# Twitch APIで解決した azumagbanjo の数値ID（本番はwrangler.jsoncにも設定）
-TWITCH_BROADCASTER_ID=""
