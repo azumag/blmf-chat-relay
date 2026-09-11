@@ -1,32 +1,80 @@
-# Twitch チャット（azumagbanjo）
+# Twitch チャット（匿名IRC）
 
-Twitch EventSub Webhookから受信し、YouTubeと同じ `comments.json`、`/api/comments/delta`、`/api/comments/delta/simple` に出力します。既存の3項目 (`name`, `message`, `created_at`) と差分APIの形式は維持します。差分のTwitchコメントID・内部投稿者IDには `twitch:<broadcaster_id>:` を付け、YouTubeとの衝突を防ぎます。
+Twitchチャットは `wss://irc-ws.chat.twitch.tv:443` へ匿名IRC-over-WebSocketで接続し、YouTubeと同じ `comments.json`、`/api/comments/delta`、`/api/comments/delta/simple` に統合します。
 
-## 初回設定
+このリレーはイベント等の限定期間だけ利用する前提です。Twitch EventSub Webhookは使いません。Twitch Client ID、OAuth token、EventSub subscription、Webhook secret、公開callback endpointはいずれも不要です。
 
-1. [Twitch Developer Console](https://dev.twitch.tv/console/apps)で、この用途のアプリを登録します。同じアプリに対して、チャットを読むユーザーから `user:read:chat` と `user:bot` の認可を取得してください。さらに配信者 `azumagbanjo` から `channel:bot` の認可を取得するか、読むユーザーをそのチャンネルのモデレーターにします。Webhook購読を登録するのは **app access token** です。ユーザーの認可取得手順は[Twitch公式ガイド](https://dev.twitch.tv/docs/chat/authenticating/)に従います。送信権限は不要です。
-2. ローカルの安全な環境に `TWITCH_CLIENT_ID` と `TWITCH_APP_ACCESS_TOKEN` を設定し、`node scripts/twitch-setup.mjs inspect` を実行します。既定の `azumagbanjo` を解決し、公開情報の数値IDだけを表示します。
-3. その数値IDを `wrangler.jsonc` の `TWITCH_BROADCASTER_ID` に設定します。`DEFAULT_TWITCH_CHANNEL` は `azumagbanjo` のままです。暗号学的にランダムなWebhook用secret（10〜100文字のASCII）を用意し、`npx wrangler secret put TWITCH_EVENTSUB_SECRET` でWorkerに登録します。同じ値を購読設定用の環境変数 `TWITCH_EVENTSUB_SECRET` に設定してください。secretやアクセストークンをソースやチャットへ貼り付けないでください。
-4. Workerを通常のリリース手順で配備します。YouTube用の既存設定はそのまま維持してください。
-5. 設定用の環境変数 `TWITCH_BROADCASTER_ID`、`TWITCH_CHAT_USER_ID`（認可した読み取りユーザーの数値ID）、`TWITCH_CALLBACK_URL=https://<Workerのホスト>/api/twitch/eventsub` を設定し、`node scripts/twitch-setup.mjs subscribe` を実行します。**R2の公開ホストではなく、管理画面を配信するWorkerのホスト**を指定してください。このコマンドが4種類の購読を登録します。同一の既存購読は変更しません。
-6. 管理画面に管理トークンを入力し、「Twitch 開始」を押します。4種類の署名付き確認通知を受け取ると「受信待機中」になります。`azumagbanjo` のチャットで実際に投稿し、管理画面の最終受信・JSON・差分APIへの反映を確認してください。「受信待機中」だけでは実チャット到達の証明にはなりません。
+## 設定
 
-ローカル検証では `.dev.vars.example` を参考にダミーsecretと設定を用意します。単体テストと `npm run test:runtime` はダミーイベントとローカルR2のみを使い、Twitchや本番R2に接続しません。
+`wrangler.jsonc` の `DEFAULT_TWITCH_CHANNEL` に読み取り対象のチャンネルloginを設定します。
 
-## 操作と出力
+```json
+"DEFAULT_TWITCH_CHANNEL": "azumagbanjo"
+```
 
-- `POST /api/twitch/start` / `POST /api/twitch/stop` は既存の `Authorization: Bearer <ADMIN_TOKEN>` で操作します。チャンネルはWorker設定で固定します。
-- YouTubeの開始・停止は既存の `/api/start` / `/api/stop` です。状態APIの既存 `enabled` / `phase` はYouTubeを示し、新しい `twitch` オブジェクトがTwitchの状態を示します。どちらも有効なら同一の一覧に混在します。
-- YouTubeの終了・エラー・手動停止でもTwitchは継続します。Twitchはオフラインのチャットも受信するため、必要なタイミングで個別に停止してください。「停止」は保存を止めます。EventSub購読自体は残り、Twitchから通知は届きます。接続を完全に解除する場合はTwitchの購読を削除してください。
-- 両方が停止した後の新しい開始でセッションを切り替えます。Twitchが動作中にYouTubeを開始した場合、そのセッションがまだ配信(videoId)を持っていなければ同じセッションとコメントを保持します。既に配信を終えたセッションであれば(Twitchを止めていなくても)新しいセッションになります。Twitch単独のアーカイブは `streams/twitch-azumagbanjo/<runId>/comments.json`、YouTube併用時は既存の動画別アーカイブです。
-- Twitchの `created_at` はEventSubメッセージのタイムスタンプです。イベントに投稿時刻フィールドがないため、厳密な投稿時刻ではありません。配信元フィールドは公開JSONへ追加していません。
-- Twitchの削除・投稿者ごとのクリア・全クリアはTwitchコメントだけを対象にし、差分には `delete` を追記します。遅れて到着した削除対象メッセージも復活させません。ただし判定はWebhookのタイムスタンプ同士の比較のため、初回配信に失敗し再送されたメッセージ（タイムスタンプが再送時刻に更新される）がクリアの後に届いた場合は、この限りではありません。該当メッセージのIDが分かれば `channel.chat.message_delete` の再送でタイムスタンプに関係なく永続的に抑制できます。
-- 通知は署名、時刻、購読種別、配信者を検証し、永続キューへの保存後に応答します。YouTube APIやR2の応答をWebhookが待つことはありません。重複通知は除外します。R2は設定された保存間隔で反映し、失敗時は再試行します。通知が1件だけでも反映されます。
+Twitch用secretはありません。Worker側で必要なsecretはYouTube API keyと管理トークンだけです。
 
-## 接続エラー
+## 動作
 
-認可取消などで購読が失効した場合はTwitch欄に理由を表示します。認可を直して購読を再登録してください。既存購読が失効状態の場合やsecretを変更した場合は、対象の購読を削除してから登録し直します。管理画面の「開始」だけでは認可や購読を修復しません。
+管理画面または `POST /api/twitch/start` でTwitchを開始すると、Durable ObjectがIRC WebSocketを開きます。
 
-対応イベント: `channel.chat.message`、`channel.chat.message_delete`、`channel.chat.clear_user_messages`、`channel.chat.clear`（すべてversion 1）。
+接続時には次を送信します。
 
-仕様: [Webhookの署名・応答](https://dev.twitch.tv/docs/eventsub/handling-webhook-events/)、[イベント定義](https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/)。
+```text
+CAP REQ :twitch.tv/tags twitch.tv/commands
+PASS SCHMOOPIIE
+NICK justinfan#####
+JOIN #<channel>
+```
+
+`justinfan#####` は実行ごとに生成する匿名guest nickです。チャット送信機能は持たず、read-onlyで利用します。
+
+受信したIRCイベントは直接R2へ書かず、既存の `twitch_pending` SQLiteキューへ永続化します。その後、Durable Object Alarmと既存の直列化処理でコメント状態へ反映し、設定された間隔でR2 snapshotを更新します。これによりYouTubeの外部I/OやR2書き込み中にIRCイベントが届いても既存の整合性モデルを維持します。
+
+対応IRCイベント:
+
+- `PRIVMSG` → コメント追加
+- `CLEARMSG` → 1コメント削除
+- `CLEARCHAT` + `target-user-id` → 投稿者単位の削除
+- `CLEARCHAT` without target → Twitchコメント全削除
+- `PING` → 即時 `PONG`
+- `RECONNECT` → WebSocket再接続
+
+`PRIVMSG` の `id`、`user-id`、`display-name`、`tmi-sent-ts` を利用します。公開JSON形式は従来どおり `name`, `message`, `created_at` の3項目です。
+
+内部コメントIDは `twitch:<source-namespace>:<message-id>` です。新規環境では `<source-namespace>` にchannel loginを使います。EventSub版から同一channelの既存runを引き継ぐ場合は、保存済みの数値 `broadcasterId` をnamespaceとして維持します。これによりデプロイ直後でも、IRCの `CLEARMSG` / `CLEARCHAT` がEventSub時代のコメントに引き続き作用します。
+
+## 接続成立判定
+
+WebSocket `open` やIRC `001 Welcome` だけでは接続完了扱いにしません。対象channelの `JOIN` / `ROOMSTATE`、または実際の `PRIVMSG` を受信して初めて管理画面の状態を `running` にします。
+
+## 再接続
+
+WebSocketの `close` / `error` / Twitch `RECONNECT` を検出すると再接続します。一時的な失敗では1秒から最大30秒まで指数バックオフします。
+
+Cloudflare Durable ObjectsのWebSocket Hibernation APIはoutbound WebSocketには使えないため、Twitch開始中は通常のoutbound接続として維持します。DOが再生成・evictされた場合にも復帰できるよう、Twitch有効中は約60秒周期のAlarmを接続watchdogとして残します。
+
+Durable ObjectのAlarmは1本だけなので、IRC切断時に再接続時刻を直接上書きせず `reconnectAt` として永続化します。YouTube poll、R2 retry、Twitch flush、IRC reconnect、watchdogのうち最も早い時刻を共通Alarmへ設定します。
+
+このサービスは限定期間だけ利用する前提なので、長期常駐サービス向けのコスト最適化より、設定不要で確実に再接続できる単純な構成を優先しています。
+
+## 開始・停止
+
+- `POST /api/twitch/start`: IRC接続を開始します。既に有効な場合も接続を張り直します。
+- `POST /api/twitch/stop`: IRC接続を閉じ、最終snapshotをR2へ反映します。
+- どちらも既存の `Authorization: Bearer <ADMIN_TOKEN>` が必要です。
+
+YouTubeとTwitchは個別に開始・停止できます。YouTubeが終了・停止してもTwitchは明示的に停止するまで継続します。
+
+Twitch単独runのarchiveは `streams/twitch-<channel>/<runId>/comments.json`、YouTube併用時は従来どおり動画別archiveを使います。
+
+## 運用確認
+
+開始後は管理画面でTwitch状態が `running` になることを確認し、実際のコメントを1件投稿して以下を確認してください。
+
+1. 管理画面の最終受信時刻が更新される
+2. `/api/comments/delta/simple` にTwitchコメントが出る
+3. `comments.json` に反映される
+4. コメント削除・timeout時にdeltaへ `delete` が出る
+
+`/api/twitch/eventsub` は廃止されています。

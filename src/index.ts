@@ -1,6 +1,6 @@
 import { ADMIN_CSS, ADMIN_HTML, ADMIN_SCRIPT } from "./admin";
 import { isAuthorized } from "./auth";
-import { readTwitchDelivery, twitchConfig, TwitchRequestError } from "./twitch";
+import { twitchConfig, TwitchRequestError } from "./twitch";
 
 export { YouTubeChatRelay } from "./relay";
 
@@ -16,28 +16,21 @@ export default {
     const url = new URL(request.url);
 
     try {
-      if (url.pathname === "/api/twitch/eventsub") {
-        if (request.method !== "POST") {
-          return new Response(null, { status: 405, headers: secureHeaders({ Allow: "POST" }) });
-        }
-        const delivery = await readTwitchDelivery(request, env);
-        await env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME).receiveTwitch(delivery);
-        return delivery.challenge === null ? new Response(null, { status: 204, headers: secureHeaders({}) }) :
-          new Response(delivery.challenge, { headers: secureHeaders({ "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": String(new TextEncoder().encode(delivery.challenge).length), "Cache-Control": "no-store" }) });
-      }
-
-      if (request.method === "POST" && (url.pathname === "/api/twitch/start" || url.pathname === "/api/twitch/stop")) {
+      if (
+        request.method === "POST" &&
+        (url.pathname === "/api/twitch/start" ||
+          url.pathname === "/api/twitch/stop")
+      ) {
         const unauthorized = await requireAuthorization(request, env);
         if (unauthorized !== null) return unauthorized;
         const isStart = url.pathname.endsWith("/start");
-        // Validate here, not just inside the Durable Object: thrown errors crossing the
-        // RPC boundary lose their prototype chain, so `instanceof TwitchRequestError`
-        // below would not match an error thrown by relay.startTwitch() itself.
         if (isStart) twitchConfig(env);
         const relay = env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME);
-        return jsonResponse(isStart ? await relay.startTwitch() : await relay.stopTwitch());
+        return jsonResponse(
+          isStart ? await relay.startTwitch() : await relay.stopTwitch(),
+        );
       }
+
       if (request.method === "GET" && url.pathname === "/") {
         return Response.redirect(new URL("/admin", url).toString(), 302);
       }
@@ -100,11 +93,7 @@ export default {
 
         const query = readCommentDeltaQuery(url);
         return jsonResponse(
-          await relay.commentsDelta(
-            query.streamId,
-            query.after,
-            query.limit,
-          ),
+          await relay.commentsDelta(query.streamId, query.after, query.limit),
           200,
           deltaCorsHeaders(),
         );
@@ -118,9 +107,7 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/start") {
         const unauthorized = await requireAuthorization(request, env);
-        if (unauthorized !== null) {
-          return unauthorized;
-        }
+        if (unauthorized !== null) return unauthorized;
 
         const body = await readJsonObject(request);
         const requestedChannel =
@@ -141,9 +128,7 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/e2e/start") {
         const unauthorized = await requireAuthorization(request, env);
-        if (unauthorized !== null) {
-          return unauthorized;
-        }
+        if (unauthorized !== null) return unauthorized;
 
         const body = await readJsonObject(request);
         const requestedChannel =
@@ -170,10 +155,7 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/stop") {
         const unauthorized = await requireAuthorization(request, env);
-        if (unauthorized !== null) {
-          return unauthorized;
-        }
-
+        if (unauthorized !== null) return unauthorized;
         return jsonResponse(await relay.stop("manual"));
       }
 
@@ -190,7 +172,9 @@ export default {
 
       return errorResponse("Not Found", 404);
     } catch (error) {
-      if (error instanceof TwitchRequestError) return errorResponse(error.message, error.status);
+      if (error instanceof TwitchRequestError) {
+        return errorResponse(error.message, error.status);
+      }
       console.error(
         JSON.stringify({
           level: "error",
@@ -238,13 +222,9 @@ function readCommentDeltaQuery(url: URL): CommentDeltaQuery {
 
 function parseOptionalCursor(rawValue: string | null): number | null {
   const value = rawValue?.trim() ?? "";
-  if (value === "") {
-    return null;
-  }
+  if (value === "") return null;
   if (!/^\d+$/.test(value)) {
-    throw new ClientInputError(
-      "after は0以上の整数カーソルで指定してください。",
-    );
+    throw new ClientInputError("after は0以上の整数カーソルで指定してください。");
   }
 
   const parsed = Number(value);
@@ -256,9 +236,7 @@ function parseOptionalCursor(rawValue: string | null): number | null {
 
 function parseDeltaLimit(rawValue: string | null): number {
   const value = rawValue?.trim() ?? "";
-  if (value === "") {
-    return DELTA_DEFAULT_LIMIT;
-  }
+  if (value === "") return DELTA_DEFAULT_LIMIT;
   if (!/^\d+$/.test(value)) {
     throw new ClientInputError(
       `limit は1〜${DELTA_MAX_LIMIT}の整数で指定してください。`,
@@ -282,10 +260,7 @@ async function requireAuthorization(
   request: Request,
   env: Env,
 ): Promise<Response | null> {
-  if (await isAuthorized(request, env.ADMIN_TOKEN)) {
-    return null;
-  }
-
+  if (await isAuthorized(request, env.ADMIN_TOKEN)) return null;
   return new Response(JSON.stringify({ error: "認証に失敗しました。" }), {
     status: 401,
     headers: secureHeaders({
@@ -308,9 +283,7 @@ async function readJsonObject(
   }
 
   const text = await request.text();
-  if (text === "") {
-    return {};
-  }
+  if (text === "") return {};
 
   let value: unknown;
   try {
@@ -322,7 +295,6 @@ async function readJsonObject(
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new ClientInputError("JSON オブジェクトを送信してください。");
   }
-
   return value as Record<string, unknown>;
 }
 
@@ -364,9 +336,7 @@ function textResponse(
 }
 
 function deltaCorsHeaders(): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": "*",
-  };
+  return { "Access-Control-Allow-Origin": "*" };
 }
 
 function secureHeaders(

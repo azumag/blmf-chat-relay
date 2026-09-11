@@ -10,19 +10,36 @@ export type TwitchEventType = (typeof TWITCH_EVENT_TYPES)[number];
 export interface TwitchState {
   enabled: boolean;
   channel: string | null;
+  /**
+   * Stable source namespace used by persisted Twitch comment IDs. EventSub used the
+   * numeric broadcaster id; IRC-only fresh installs use the normalized channel login.
+   * Keeping an existing value for the same channel lets an in-place EventSub -> IRC
+   * deployment continue to delete/moderate comments already stored in the active run.
+   */
   broadcasterId: string | null;
   phase: "stopped" | "waiting" | "running" | "error";
   startedAt: string | null;
   lastReceivedAt: string | null;
   lastError: string | null;
+  /** Legacy EventSub field retained for storage/status compatibility. */
   subscriptions: Partial<Record<TwitchEventType, string>>;
   flushAt: string | null;
+  /** Next allowed IRC reconnect attempt. Missing in legacy persisted state. */
+  reconnectAt?: string | null;
 }
 
 export function createTwitchState(): TwitchState {
   return {
-    enabled: false, channel: null, broadcasterId: null, phase: "stopped",
-    startedAt: null, lastReceivedAt: null, lastError: null, subscriptions: {}, flushAt: null,
+    enabled: false,
+    channel: null,
+    broadcasterId: null,
+    phase: "stopped",
+    startedAt: null,
+    lastReceivedAt: null,
+    lastError: null,
+    subscriptions: {},
+    flushAt: null,
+    reconnectAt: null,
   };
 }
 
@@ -32,134 +49,310 @@ export type TwitchMutation =
   | { kind: "clear-user"; authorId: string }
   | { kind: "clear" };
 
+/**
+ * Transport-neutral queue payload. The shape intentionally stays close to the old
+ * EventSub delivery so the durable queue/storage layer can be reused unchanged.
+ */
 export interface TwitchDelivery {
   id: string;
   timestamp: string;
   type: TwitchEventType;
   subscriptionId: string;
   broadcasterId: string;
-  kind: "notification" | "webhook_callback_verification" | "revocation";
-  challenge: string | null;
-  reason: string | null;
-  mutation: TwitchMutation | null;
+  kind: "notification";
+  challenge: null;
+  reason: null;
+  mutation: TwitchMutation;
 }
+
+export type TwitchIrcEvent =
+  | { kind: "ping"; payload: string; channel: null }
+  | { kind: "reconnect" }
+  | { kind: "activity"; channel: string | null; confirmsJoin: boolean }
+  | { kind: "notice"; channel: string | null; code: string | null; message: string }
+  | { kind: "delivery"; delivery: TwitchDelivery };
 
 export class TwitchRequestError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
 }
+
+const TWITCH_IRC_URL = "wss://irc-ws.chat.twitch.tv:443";
 
 export function twitchConfig(env: Env) {
-  const channel = env.DEFAULT_TWITCH_CHANNEL?.trim().toLowerCase() ?? "";
-  const broadcasterId = env.TWITCH_BROADCASTER_ID?.trim() ?? "";
-  const secret = env.TWITCH_EVENTSUB_SECRET;
-  if (!/^[a-z0-9_]{1,25}$/.test(channel) || !/^\d+$/.test(broadcasterId) ||
-      typeof secret !== "string" || !/^[\x21-\x7e]{10,100}$/.test(secret)) {
-    throw new TwitchRequestError("Twitchの初期設定が必要です。docs/twitch.md を確認してください。", 503);
+  const channel = env.DEFAULT_TWITCH_CHANNEL?.trim().replace(/^#/, "").toLowerCase() ?? "";
+  if (!/^[a-z0-9_]{1,25}$/.test(channel)) {
+    throw new TwitchRequestError(
+      "DEFAULT_TWITCH_CHANNEL にTwitchチャンネル名を設定してください。",
+      503,
+    );
   }
-  return { channel, broadcasterId, secret };
+  return { channel, url: TWITCH_IRC_URL };
 }
 
-// Read a bounded raw body: HMAC must cover the exact bytes, before parsing JSON.
-export async function readTwitchDelivery(request: Request, env: Env): Promise<TwitchDelivery> {
-  const now = Date.now();
-  const config = twitchConfig(env);
-  const id = request.headers.get("Twitch-Eventsub-Message-Id") ?? "";
-  const timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp") ?? "";
-  const signature = request.headers.get("Twitch-Eventsub-Message-Signature") ?? "";
-  const sentAt = Date.parse(timestamp);
-  if (!id || id.length > 256 || !Number.isFinite(sentAt) ||
-      now - sentAt > 600_000 || sentAt - now > 60_000 ||
-      !/^sha256=[0-9a-f]{64}$/.test(signature)) {
-    throw new TwitchRequestError("Invalid Twitch signature or timestamp", 403);
+export function shouldAttemptTwitchReconnect(
+  state: TwitchState,
+  now = Date.now(),
+): boolean {
+  const reconnectAt = Date.parse(state.reconnectAt ?? "");
+  return !Number.isFinite(reconnectAt) || reconnectAt <= now;
+}
+
+/** Preserve the pre-migration numeric EventSub namespace while the channel is unchanged. */
+export function twitchSourceNamespace(state: TwitchState, channel: string): string {
+  if (
+    state.channel === channel &&
+    typeof state.broadcasterId === "string" &&
+    state.broadcasterId !== ""
+  ) {
+    return state.broadcasterId;
   }
-  const reader = request.body?.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  if (reader) {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      length += value.byteLength;
-      if (length > 65_536) {
-        await reader.cancel();
-        throw new TwitchRequestError("Twitch payload too large", 413);
-      }
-      chunks.push(value);
-    }
+  return channel;
+}
+
+export function withTwitchNamespace(
+  delivery: TwitchDelivery,
+  broadcasterId: string,
+): TwitchDelivery {
+  return delivery.broadcasterId === broadcasterId
+    ? delivery
+    : { ...delivery, broadcasterId };
+}
+
+export function createGuestNick(random: () => number = Math.random): string {
+  return `justinfan${Math.floor(10_000 + random() * 90_000)}`;
+}
+
+export function twitchIrcHandshake(channel: string, nick: string): string[] {
+  return [
+    "CAP REQ :twitch.tv/tags twitch.tv/commands",
+    "PASS SCHMOOPIIE",
+    `NICK ${nick}`,
+    `JOIN #${channel}`,
+  ];
+}
+
+export function parseTwitchIrcFrame(
+  frame: string,
+  now: () => number = Date.now,
+): TwitchIrcEvent[] {
+  const events: TwitchIrcEvent[] = [];
+  for (const rawLine of frame.split("\n")) {
+    const parsed = parseIrcLine(rawLine, now);
+    if (parsed !== null) events.push(parsed);
   }
-  const raw = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) { raw.set(chunk, offset); offset += chunk.byteLength; }
-  const prefix = new TextEncoder().encode(id + timestamp);
-  const signed = new Uint8Array(prefix.length + raw.length);
-  signed.set(prefix); signed.set(raw, prefix.length);
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(config.secret),
-    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
-  const digest = Uint8Array.from(signature.slice(7).match(/../g)!, (hex) => parseInt(hex, 16));
-  if (!await crypto.subtle.verify("HMAC", key, digest, signed)) {
-    throw new TwitchRequestError("Invalid Twitch signature", 403);
+  return events;
+}
+
+interface ParsedLine {
+  tags: Record<string, string>;
+  prefix: string;
+  command: string;
+  params: string[];
+  trailing: string;
+}
+
+function parseIrcLine(rawLine: string, now: () => number): TwitchIrcEvent | null {
+  let rest = rawLine.replace(/\r$/, "").trim();
+  if (rest === "") return null;
+
+  let tags: Record<string, string> = {};
+  if (rest.startsWith("@")) {
+    const end = rest.indexOf(" ");
+    if (end < 0) return null;
+    tags = parseIrcTags(rest.slice(1, end));
+    rest = rest.slice(end + 1);
   }
-  let body: Record<string, unknown>;
-  try { body = object(JSON.parse(new TextDecoder().decode(raw))); }
-  catch { throw new TwitchRequestError("Invalid Twitch JSON", 400); }
-  const subscription = object(body.subscription);
-  const condition = object(subscription.condition);
-  const type = subscription.type;
-  if (!TWITCH_EVENT_TYPES.includes(type as TwitchEventType) || subscription.version !== "1" ||
-      request.headers.get("Twitch-Eventsub-Subscription-Type") !== type ||
-      request.headers.get("Twitch-Eventsub-Subscription-Version") !== "1" ||
-      condition.broadcaster_user_id !== config.broadcasterId) {
-    throw new TwitchRequestError("Unexpected Twitch subscription", 403);
+
+  let prefix = "";
+  if (rest.startsWith(":")) {
+    const end = rest.indexOf(" ");
+    if (end < 0) return null;
+    prefix = rest.slice(1, end);
+    rest = rest.slice(end + 1);
   }
-  const kind = request.headers.get("Twitch-Eventsub-Message-Type");
-  if (kind !== "notification" && kind !== "webhook_callback_verification" && kind !== "revocation") {
-    throw new TwitchRequestError("Unexpected Twitch message type", 400);
+
+  const trailingIndex = rest.indexOf(" :");
+  const head = trailingIndex >= 0 ? rest.slice(0, trailingIndex) : rest;
+  const trailing = trailingIndex >= 0 ? rest.slice(trailingIndex + 2) : "";
+  const parts = head.trim().split(/\s+/).filter(Boolean);
+  const command = parts.shift()?.toUpperCase() ?? "";
+  if (command === "") return null;
+  const line: ParsedLine = { tags, prefix, command, params: parts, trailing };
+
+  if (command === "PING") {
+    const payload = trailing !== "" ? `:${trailing}` : parts[0] ?? "";
+    return { kind: "ping", payload, channel: null };
   }
-  // The message-type header itself is not covered by Twitch's HMAC.
-  const status = subscription.status;
-  if ((kind === "notification" && status !== "enabled") ||
-      (kind === "webhook_callback_verification" && status !== "webhook_callback_verification_pending") ||
-      (kind === "revocation" && !["authorization_revoked", "user_removed", "version_removed", "notification_failures_exceeded"].includes(String(status)))) {
-    throw new TwitchRequestError("Unexpected Twitch subscription status", 400);
+  if (command === "RECONNECT") return { kind: "reconnect" };
+
+  const channel = normalizeChannel(parts.find((part) => part.startsWith("#")) ?? "");
+  if (command === "NOTICE") {
+    return {
+      kind: "notice",
+      channel: channel || null,
+      code: tags["msg-id"] || null,
+      message: trailing,
+    };
   }
-  let mutation: TwitchMutation | null = null;
-  if (kind === "notification") {
-    const event = object(body.event);
-    // Check only the immutable id, not broadcaster_user_login: a channel rename would
-    // otherwise 403 every notification (login still matches the id, just not the
-    // possibly-stale DEFAULT_TWITCH_CHANNEL config) until redeployed with the new
-    // login, and Twitch counts repeated failures toward revoking all four subscriptions.
-    if (event.broadcaster_user_id !== config.broadcasterId) {
-      throw new TwitchRequestError("Unexpected Twitch channel", 403);
-    }
-    switch (type) {
-      case "channel.chat.message":
-        mutation = { kind: "message", id: field(event.message_id), authorId: field(event.chatter_user_id),
-          name: field(event.chatter_user_name), message: field(object(event.message).text) };
-        break;
-      case "channel.chat.message_delete": mutation = { kind: "delete", id: field(event.message_id) }; break;
-      case "channel.chat.clear_user_messages": mutation = { kind: "clear-user", authorId: field(event.target_user_id) }; break;
-      case "channel.chat.clear": mutation = { kind: "clear" }; break;
-    }
+
+  // 001 only proves the IRC session authenticated. A channel-specific JOIN/ROOMSTATE
+  // (or an actual PRIVMSG below) is required before the relay reports `running`.
+  if (command === "ROOMSTATE" || command === "JOIN") {
+    return { kind: "activity", channel: channel || null, confirmsJoin: channel !== "" };
   }
+  if (/^\d{3}$/.test(command)) {
+    return { kind: "activity", channel: channel || null, confirmsJoin: false };
+  }
+
+  if (channel === "") return null;
+  if (command === "PRIVMSG") return parsePrivmsg(line, channel, now);
+  if (command === "CLEARMSG") return parseClearmsg(line, channel, now);
+  if (command === "CLEARCHAT") return parseClearchat(line, channel, now);
+  return { kind: "activity", channel, confirmsJoin: false };
+}
+
+function parsePrivmsg(
+  line: ParsedLine,
+  channel: string,
+  now: () => number,
+): TwitchIrcEvent | null {
+  const id = bounded(line.tags.id, 256);
+  const authorId = bounded(line.tags["user-id"], 256);
+  if (id === null || authorId === null) return null;
+  const login = line.prefix.split("!")[0] ?? "";
+  const name = bounded(line.tags["display-name"] || login, 256);
+  if (name === null) return null;
+  const timestamp = ircTimestamp(line.tags["tmi-sent-ts"], now);
   return {
-    id, timestamp: new Date(sentAt).toISOString(), type: type as TwitchEventType,
-    subscriptionId: field(subscription.id), broadcasterId: config.broadcasterId, kind,
-    challenge: kind === "webhook_callback_verification" ? field(body.challenge) : null,
-    reason: kind === "revocation" ? field(subscription.status) : null, mutation,
+    kind: "delivery",
+    delivery: makeDelivery(
+      id,
+      timestamp,
+      channel,
+      "channel.chat.message",
+      { kind: "message", id, authorId, name, message: line.trailing },
+    ),
   };
 }
 
-function object(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new TwitchRequestError("Invalid Twitch payload", 400);
-  }
-  return value as Record<string, unknown>;
+function parseClearmsg(
+  line: ParsedLine,
+  channel: string,
+  now: () => number,
+): TwitchIrcEvent | null {
+  const messageId = bounded(line.tags["target-msg-id"], 256);
+  if (messageId === null) return null;
+  const timestamp = ircTimestamp(line.tags["tmi-sent-ts"], now);
+  return {
+    kind: "delivery",
+    delivery: makeDelivery(
+      `clearmsg:${messageId}:${timestamp}`,
+      timestamp,
+      channel,
+      "channel.chat.message_delete",
+      { kind: "delete", id: messageId },
+    ),
+  };
 }
 
-function field(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 4096) {
-    throw new TwitchRequestError("Invalid Twitch field", 400);
+function parseClearchat(
+  line: ParsedLine,
+  channel: string,
+  now: () => number,
+): TwitchIrcEvent {
+  const timestamp = ircTimestamp(line.tags["tmi-sent-ts"], now);
+  const targetUserId = bounded(line.tags["target-user-id"], 256);
+  if (targetUserId !== null) {
+    return {
+      kind: "delivery",
+      delivery: makeDelivery(
+        `clearchat:${targetUserId}:${timestamp}`,
+        timestamp,
+        channel,
+        "channel.chat.clear_user_messages",
+        { kind: "clear-user", authorId: targetUserId },
+      ),
+    };
   }
-  return value;
+  return {
+    kind: "delivery",
+    delivery: makeDelivery(
+      `clearchat:${timestamp}`,
+      timestamp,
+      channel,
+      "channel.chat.clear",
+      { kind: "clear" },
+    ),
+  };
+}
+
+function makeDelivery(
+  id: string,
+  timestamp: string,
+  channel: string,
+  type: TwitchEventType,
+  mutation: TwitchMutation,
+): TwitchDelivery {
+  return {
+    id,
+    timestamp,
+    type,
+    subscriptionId: "irc",
+    broadcasterId: channel,
+    kind: "notification",
+    challenge: null,
+    reason: null,
+    mutation,
+  };
+}
+
+function parseIrcTags(raw: string): Record<string, string> {
+  const tags: Record<string, string> = {};
+  for (const part of raw.split(";")) {
+    const separator = part.indexOf("=");
+    const key = separator < 0 ? part : part.slice(0, separator);
+    if (key !== "") {
+      tags[key] = decodeIrcTag(separator < 0 ? "" : part.slice(separator + 1));
+    }
+  }
+  return tags;
+}
+
+function decodeIrcTag(value: string): string {
+  let output = "";
+  const escapes: Record<string, string> = {
+    s: " ",
+    ":": ";",
+    r: "\r",
+    n: "\n",
+    "\\": "\\",
+  };
+  for (let index = 0; index < value.length; index += 1) {
+    const current = value.charAt(index);
+    if (current !== "\\") {
+      output += current;
+      continue;
+    }
+    const next = value.charAt(++index);
+    output += escapes[next] ?? next;
+  }
+  return output;
+}
+
+function normalizeChannel(value: string): string {
+  return value.replace(/^#/, "").toLowerCase();
+}
+
+function ircTimestamp(raw: string | undefined, now: () => number): string {
+  const parsed = Number(raw);
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : now();
+  return new Date(value).toISOString();
+}
+
+function bounded(value: string | undefined, max: number): string | null {
+  return typeof value === "string" && value.length > 0 && value.length <= max
+    ? value
+    : null;
 }

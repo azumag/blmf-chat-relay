@@ -7,7 +7,6 @@
   "vars": {
     "DEFAULT_YOUTUBE_CHANNEL": "",
     "DEFAULT_TWITCH_CHANNEL": "azumagbanjo",
-    "TWITCH_BROADCASTER_ID": "",
     "PUBLIC_R2_BASE_URL": "https://chat.blmf.bluemoon.works",
     "R2_CURRENT_OBJECT_KEY": "comments.json",
     "R2_STATUS_OBJECT_KEY": "status.json",
@@ -15,7 +14,7 @@
     "R2_FLUSH_INTERVAL_SECONDS": "15"
   },
   "secrets": {
-    "required": ["YOUTUBE_API_KEY", "ADMIN_TOKEN", "TWITCH_EVENTSUB_SECRET"]
+    "required": ["YOUTUBE_API_KEY", "ADMIN_TOKEN"]
   },
   "r2_buckets": [
     {
