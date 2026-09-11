@@ -22,6 +22,8 @@ export interface TwitchState {
   /** Legacy EventSub field; retained so old persisted state remains readable. */
   subscriptions: Partial<Record<TwitchEventType, string>>;
   flushAt: string | null;
+  /** Next allowed IRC reconnect attempt. Missing in legacy persisted state. */
+  reconnectAt?: string | null;
 }
 
 export function createTwitchState(): TwitchState {
@@ -35,6 +37,7 @@ export function createTwitchState(): TwitchState {
     lastError: null,
     subscriptions: {},
     flushAt: null,
+    reconnectAt: null,
   };
 }
 
