@@ -14,6 +14,8 @@ import {
   shouldAttemptTwitchReconnect,
   twitchConfig,
   twitchIrcHandshake,
+  twitchSourceNamespace,
+  withTwitchNamespace,
   type TwitchDelivery,
 } from "./twitch";
 import {
@@ -65,11 +67,14 @@ export class YouTubeChatRelay extends DurableObject<Env> {
 
     ctx.blockConcurrencyWhile(async () => {
       initializeRelayStorage(this.ctx.storage);
-      // Outbound WebSockets cannot use Durable Object WebSocket hibernation. Keep an
-      // alarm armed while Twitch is enabled so a recreated/evicted object reconnects
-      // even when no HTTP request happens to wake it first.
+      // Outbound WebSockets cannot hibernate with the DO. If the object is recreated
+      // while Twitch is enabled, wake immediately and rebuild the connection. The
+      // normal serialized reconciliation will restore the earliest real deadline.
       if (this.loadState().twitch.enabled) {
-        await this.ctx.storage.setAlarm(Date.now());
+        const alarm = await this.ctx.storage.getAlarm();
+        if (alarm === null || alarm > Date.now()) {
+          await this.ctx.storage.setAlarm(Date.now());
+        }
       }
     });
   }
@@ -107,6 +112,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       }
 
       const sameChannel = state.twitch.channel === config.channel;
+      const sourceNamespace = twitchSourceNamespace(state.twitch, config.channel);
       this.closeTwitchSocket();
       state = {
         ...state,
@@ -115,9 +121,9 @@ export class YouTubeChatRelay extends DurableObject<Env> {
           ...state.twitch,
           enabled: true,
           channel: config.channel,
-          // relay-storage historically uses broadcasterId as the Twitch source
-          // namespace. IRC has no broadcaster-id lookup, so use the normalized login.
-          broadcasterId: config.channel,
+          // Preserve an existing numeric EventSub broadcaster id for the same channel.
+          // Old and new comments then share one moderation namespace during migration.
+          broadcasterId: sourceNamespace,
           subscriptions: {},
           phase: "waiting",
           startedAt:
@@ -166,6 +172,8 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         "INSERT INTO twitch_pending (delivery) VALUES (?)",
         JSON.stringify(delivery),
       );
+      // This deliberately arms an immediate alarm. It never delays another deadline;
+      // after the queue is drained runSerially() reconciles the one DO alarm again.
       const alarm = await transaction.getAlarm();
       if (alarm === null || alarm > Date.now()) {
         await transaction.setAlarm(Date.now());
@@ -318,8 +326,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
           state.lastError?.startsWith("R2:") === true &&
           Date.parse(state.nextActionAt ?? "") <= Date.now()
         ) {
-          const flush = await this.safeFlushSnapshot(state, true);
-          if (flush.success) await this.ctx.storage.deleteAlarm();
+          await this.safeFlushSnapshot(state, true);
         }
         return;
       }
@@ -339,6 +346,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     });
   }
 
+  /** Called only from serialized control/alarm operations. */
   private ensureTwitchConnection(): void {
     const state = this.loadState();
     if (!state.twitch.enabled) {
@@ -369,6 +377,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       return;
     }
 
+    const sourceNamespace = twitchSourceNamespace(state.twitch, config.channel);
     const generation = ++this.twitchSocketGeneration;
     this.twitchSocket = socket;
     this.twitchNick = createGuestNick();
@@ -377,7 +386,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       twitch: {
         ...state.twitch,
         channel: config.channel,
-        broadcasterId: config.channel,
+        broadcasterId: sourceNamespace,
         subscriptions: {},
         phase: "waiting",
         lastError: null,
@@ -397,9 +406,10 @@ export class YouTubeChatRelay extends DurableObject<Env> {
           nick: this.twitchNick,
         });
       } catch (error) {
-        this.scheduleTwitchReconnect(
+        this.beginTwitchReconnect(
           socket,
           generation,
+          config.channel,
           `IRC handshake failed: ${errorMessage(error)}`,
         );
       }
@@ -414,31 +424,63 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       try {
         for (const item of parseTwitchIrcFrame(event.data)) {
           if (item.kind === "ping") {
+            // PONG is the only socket callback action intentionally kept outside the
+            // Promise chain: it does not touch relay_state and should never wait on R2.
             socket.send(`PONG ${item.payload}`);
-            this.markTwitchConnected(item.channel ?? null);
             continue;
           }
           if (item.kind === "reconnect") {
-            this.scheduleTwitchReconnect(
+            this.beginTwitchReconnect(
               socket,
               generation,
+              config.channel,
               "Twitch requested reconnect",
               0,
             );
             return;
           }
           if (item.kind === "notice") {
-            this.markTwitchConnected(item.channel);
-            this.recordTwitchNotice(item.code, item.message);
+            this.queueTwitchOperation(
+              "twitch_irc_notice_state_error",
+              () => this.recordTwitchNotice(
+                socket,
+                generation,
+                config.channel,
+                item.code,
+                item.message,
+              ),
+            );
             continue;
           }
           if (item.kind === "activity") {
-            this.markTwitchConnected(item.channel);
+            if (item.confirmsJoin) {
+              this.queueTwitchOperation(
+                "twitch_irc_join_state_error",
+                () => this.markTwitchConnected(
+                  socket,
+                  generation,
+                  item.channel,
+                  sourceNamespace,
+                ),
+              );
+            }
             continue;
           }
-          this.markTwitchConnected(item.delivery.broadcasterId);
+
+          const delivery = withTwitchNamespace(item.delivery, sourceNamespace);
+          // A PRIVMSG itself proves that channel membership works. Serialize the status
+          // transition, but persist the event immediately through the durable queue.
+          this.queueTwitchOperation(
+            "twitch_irc_message_state_error",
+            () => this.markTwitchConnected(
+              socket,
+              generation,
+              item.delivery.broadcasterId,
+              sourceNamespace,
+            ),
+          );
           this.ctx.waitUntil(
-            this.receiveTwitch(item.delivery).catch((error) => {
+            this.receiveTwitch(delivery).catch((error) => {
               this.log("twitch_irc_enqueue_error", {
                 message: errorMessage(error),
               });
@@ -451,17 +493,46 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     });
 
     socket.addEventListener("error", () => {
-      this.scheduleTwitchReconnect(socket, generation, "IRC socket error");
+      this.beginTwitchReconnect(
+        socket,
+        generation,
+        config.channel,
+        "IRC socket error",
+      );
     });
     socket.addEventListener("close", () => {
-      this.scheduleTwitchReconnect(socket, generation, "IRC socket closed");
+      this.beginTwitchReconnect(
+        socket,
+        generation,
+        config.channel,
+        "IRC socket closed",
+      );
     });
   }
 
-  private markTwitchConnected(channel: string | null): void {
+  private queueTwitchOperation(
+    event: string,
+    operation: () => Promise<void> | void,
+  ): void {
+    this.ctx.waitUntil(
+      this.runSerially(operation).catch((error) => {
+        this.log(event, { message: errorMessage(error) });
+      }),
+    );
+  }
+
+  /** Runs inside runSerially(). */
+  private markTwitchConnected(
+    socket: WebSocket,
+    generation: number,
+    channel: string | null,
+    sourceNamespace: string,
+  ): void {
+    if (!this.ownsTwitchSocket(socket, generation)) return;
     const state = this.loadState();
     if (!state.twitch.enabled) return;
     if (channel !== null && channel !== state.twitch.channel) return;
+    if (state.twitch.broadcasterId !== sourceNamespace) return;
     this.twitchReconnectAttempt = 0;
     if (
       state.twitch.phase === "running" &&
@@ -485,10 +556,17 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     });
   }
 
-  private recordTwitchNotice(code: string | null, message: string): void {
-    if (message === "") return;
+  /** Runs inside runSerially(). */
+  private recordTwitchNotice(
+    socket: WebSocket,
+    generation: number,
+    expectedChannel: string,
+    code: string | null,
+    message: string,
+  ): void {
+    if (message === "" || !this.ownsTwitchSocket(socket, generation)) return;
     const state = this.loadState();
-    if (!state.twitch.enabled) return;
+    if (!state.twitch.enabled || state.twitch.channel !== expectedChannel) return;
     this.saveState({
       ...state,
       twitch: {
@@ -500,6 +578,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     this.log("twitch_irc_notice", { code, message });
   }
 
+  /** Runs inside startTwitch()/alarm() serialization; alarm reconciliation happens later. */
   private recordTwitchConnectFailure(message: string): void {
     const state = this.loadState();
     if (!state.twitch.enabled) return;
@@ -516,57 +595,55 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       },
       updatedAt: new Date().toISOString(),
     });
-    this.ctx.waitUntil(
-      this.ctx.storage.setAlarm(reconnectAt).catch((error) => {
-        this.log("twitch_reconnect_alarm_error", {
-          message: errorMessage(error),
-        });
-      }),
-    );
   }
 
-  private scheduleTwitchReconnect(
+  /**
+   * Detach the broken socket synchronously, but serialize the relay_state mutation.
+   * This prevents a callback arriving during YouTube/R2 awaits from overwriting newer
+   * state. The serialized operation only records reconnectAt; runSerially's final
+   * reconciliation chooses the minimum of YouTube, R2, flush, reconnect and watchdog.
+   */
+  private beginTwitchReconnect(
     socket: WebSocket,
     generation: number,
+    expectedChannel: string,
     reason: string,
     overrideDelay?: number,
   ): void {
     if (!this.ownsTwitchSocket(socket, generation)) return;
     this.twitchSocket = null;
     this.twitchNick = null;
-    ++this.twitchSocketGeneration;
+    const detachedGeneration = ++this.twitchSocketGeneration;
     try {
       if (socket.readyState < 2) socket.close();
     } catch {
-      // The connection is already being discarded; reconnect below is authoritative.
+      // The connection is already discarded; the serialized transition is authoritative.
     }
 
-    const state = this.loadState();
-    if (!state.twitch.enabled) return;
-    const delay = overrideDelay ?? this.nextTwitchReconnectDelay();
-    const reconnectAt = Date.now() + delay;
-    this.saveState({
-      ...state,
-      twitch: {
-        ...state.twitch,
-        phase: "error",
-        subscriptions: {},
-        lastError: `Twitch IRC: ${reason}`,
+    this.queueTwitchOperation("twitch_reconnect_state_error", () => {
+      // A start/stop/reconnect that happened while this operation waited makes this
+      // callback stale. Never let an old socket put a newer one into error state.
+      if (this.twitchSocketGeneration !== detachedGeneration) return;
+      const state = this.loadState();
+      if (!state.twitch.enabled || state.twitch.channel !== expectedChannel) return;
+      const delay = overrideDelay ?? this.nextTwitchReconnectDelay();
+      const reconnectAt = Date.now() + delay;
+      this.saveState({
+        ...state,
+        twitch: {
+          ...state.twitch,
+          phase: "error",
+          subscriptions: {},
+          lastError: `Twitch IRC: ${reason}`,
+          reconnectAt: new Date(reconnectAt).toISOString(),
+        },
+        updatedAt: new Date().toISOString(),
+      });
+      this.log("twitch_irc_reconnect_scheduled", {
+        reason,
+        delay,
         reconnectAt: new Date(reconnectAt).toISOString(),
-      },
-      updatedAt: new Date().toISOString(),
-    });
-    this.ctx.waitUntil(
-      this.ctx.storage.setAlarm(reconnectAt).catch((error) => {
-        this.log("twitch_reconnect_alarm_error", {
-          message: errorMessage(error),
-        });
-      }),
-    );
-    this.log("twitch_irc_reconnect_scheduled", {
-      reason,
-      delay,
-      reconnectAt: new Date(reconnectAt).toISOString(),
+      });
     });
   }
 
@@ -732,7 +809,8 @@ export class YouTubeChatRelay extends DurableObject<Env> {
   private async stopInternal(reason: string): Promise<RelayStatus> {
     let state = this.loadState();
     if (!state.enabled) {
-      await this.ctx.storage.deleteAlarm();
+      // Do not permanently delete Twitch's watchdog/reconnect alarm. runSerially()
+      // reconciles the shared alarm after this operation completes.
       state = (await this.safeFlushSnapshot(state, true)).state;
       return this.statusFor(state);
     }
@@ -749,7 +827,6 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       consecutiveErrors: 0,
     };
     this.saveState(state);
-    await this.ctx.storage.deleteAlarm();
     state = (await this.safeFlushSnapshot(state, true)).state;
 
     this.log("relay_stopped", {
@@ -786,7 +863,6 @@ export class YouTubeChatRelay extends DurableObject<Env> {
           nextActionAt: null,
         };
         this.saveState(state);
-        await this.ctx.storage.deleteAlarm();
         await this.safeFlushSnapshot(state, true);
         return;
       }
@@ -802,7 +878,6 @@ export class YouTubeChatRelay extends DurableObject<Env> {
           nextActionAt: new Date(nextAlarmAt).toISOString(),
         };
         this.saveState(state);
-        await this.ctx.storage.setAlarm(nextAlarmAt);
         await this.safeFlushSnapshot(state, true);
         return;
       }
@@ -828,7 +903,6 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       nextActionAt: new Date(nextAlarmAt).toISOString(),
     };
     this.saveState(state);
-    await this.ctx.storage.setAlarm(nextAlarmAt);
     await this.safeFlushSnapshot(state, true);
     this.log("relay_cycle_error", {
       runId,
@@ -854,7 +928,6 @@ export class YouTubeChatRelay extends DurableObject<Env> {
       nextActionAt: null,
     };
     this.saveState(failed);
-    await this.ctx.storage.deleteAlarm();
     await this.safeFlushSnapshot(failed, true);
     this.log("relay_fatal_error", { runId: failed.runId, message });
   }
@@ -904,7 +977,6 @@ export class YouTubeChatRelay extends DurableObject<Env> {
             : new Date(retryAt).toISOString(),
       };
       this.saveState(failed);
-      if (retryAt !== null) await this.ctx.storage.setAlarm(retryAt);
       this.log("r2_flush_error", {
         runId: failed.runId,
         message: errorMessage(error),
