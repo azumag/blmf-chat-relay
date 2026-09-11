@@ -11,6 +11,7 @@ import {
   TWITCH_EVENT_TYPES,
   createGuestNick,
   parseTwitchIrcFrame,
+  shouldAttemptTwitchReconnect,
   twitchConfig,
   twitchIrcHandshake,
   type TwitchDelivery,
@@ -128,6 +129,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
             state.twitch.enabled && sameChannel
               ? state.twitch.lastReceivedAt
               : null,
+          reconnectAt: null,
         },
       };
       this.saveState(state);
@@ -148,6 +150,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
           phase: "stopped",
           subscriptions: {},
           lastError: null,
+          reconnectAt: null,
         },
       };
       this.saveState(stopped);
@@ -348,6 +351,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     ) {
       return;
     }
+    if (!shouldAttemptTwitchReconnect(state.twitch)) return;
 
     let config: ReturnType<typeof twitchConfig>;
     try {
@@ -377,6 +381,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         subscriptions: {},
         phase: "waiting",
         lastError: null,
+        reconnectAt: null,
       },
       updatedAt: new Date().toISOString(),
     });
@@ -458,13 +463,20 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     if (!state.twitch.enabled) return;
     if (channel !== null && channel !== state.twitch.channel) return;
     this.twitchReconnectAttempt = 0;
-    if (state.twitch.phase === "running" && state.twitch.lastError === null) return;
+    if (
+      state.twitch.phase === "running" &&
+      state.twitch.lastError === null &&
+      state.twitch.reconnectAt == null
+    ) {
+      return;
+    }
     this.saveState({
       ...state,
       twitch: {
         ...state.twitch,
         phase: "running",
         lastError: null,
+        reconnectAt: null,
         subscriptions: Object.fromEntries(
           TWITCH_EVENT_TYPES.map((type) => [type, "irc"]),
         ) as RelayState["twitch"]["subscriptions"],
@@ -492,6 +504,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     const state = this.loadState();
     if (!state.twitch.enabled) return;
     const delay = this.nextTwitchReconnectDelay();
+    const reconnectAt = Date.now() + delay;
     this.saveState({
       ...state,
       twitch: {
@@ -499,11 +512,12 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         phase: "error",
         subscriptions: {},
         lastError: `Twitch IRC: ${message}`,
+        reconnectAt: new Date(reconnectAt).toISOString(),
       },
       updatedAt: new Date().toISOString(),
     });
     this.ctx.waitUntil(
-      this.ctx.storage.setAlarm(Date.now() + delay).catch((error) => {
+      this.ctx.storage.setAlarm(reconnectAt).catch((error) => {
         this.log("twitch_reconnect_alarm_error", {
           message: errorMessage(error),
         });
@@ -530,6 +544,7 @@ export class YouTubeChatRelay extends DurableObject<Env> {
     const state = this.loadState();
     if (!state.twitch.enabled) return;
     const delay = overrideDelay ?? this.nextTwitchReconnectDelay();
+    const reconnectAt = Date.now() + delay;
     this.saveState({
       ...state,
       twitch: {
@@ -537,17 +552,22 @@ export class YouTubeChatRelay extends DurableObject<Env> {
         phase: "error",
         subscriptions: {},
         lastError: `Twitch IRC: ${reason}`,
+        reconnectAt: new Date(reconnectAt).toISOString(),
       },
       updatedAt: new Date().toISOString(),
     });
     this.ctx.waitUntil(
-      this.ctx.storage.setAlarm(Date.now() + delay).catch((error) => {
+      this.ctx.storage.setAlarm(reconnectAt).catch((error) => {
         this.log("twitch_reconnect_alarm_error", {
           message: errorMessage(error),
         });
       }),
     );
-    this.log("twitch_irc_reconnect_scheduled", { reason, delay });
+    this.log("twitch_irc_reconnect_scheduled", {
+      reason,
+      delay,
+      reconnectAt: new Date(reconnectAt).toISOString(),
+    });
   }
 
   private nextTwitchReconnectDelay(): number {
