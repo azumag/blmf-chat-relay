@@ -61,7 +61,7 @@ Twitchのoutbound WebSocketはCloudflareのWebSocket Hibernation対象ではあ�
 - `/api/comments/delta`
 - `/api/comments/delta/simple`
 
-Twitchの内部コメントIDは `twitch:<channel>:<message-id>` としてYouTube IDとの衝突を防ぎます。
+Twitchの内部コメントIDは `twitch:<source-namespace>:<message-id>` としてYouTube IDとの衝突を防ぎます。新規IRC環境では `<source-namespace>` はchannel loginです。EventSub版から同一channelを引き継いだ環境では、既存コメントとの削除互換性を保つため保存済みの数値broadcaster IDを継続利用する場合があります。
 
 ### 状態
 
