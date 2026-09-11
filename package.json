@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "wrangler dev",
+    "build": "npm run check",
     "deploy": "wrangler deploy",
     "types": "wrangler types",
     "typecheck": "npm run types && tsc --noEmit",
