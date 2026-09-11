@@ -62,7 +62,7 @@ export interface TwitchDelivery {
 }
 
 export type TwitchIrcEvent =
-  | { kind: "ping"; payload: string }
+  | { kind: "ping"; payload: string; channel: null }
   | { kind: "reconnect" }
   | { kind: "activity"; channel: string | null }
   | { kind: "notice"; channel: string | null; code: string | null; message: string }
@@ -150,7 +150,7 @@ function parseIrcLine(rawLine: string, now: () => number): TwitchIrcEvent | null
 
   if (command === "PING") {
     const payload = trailing !== "" ? `:${trailing}` : parts[0] ?? "";
-    return { kind: "ping", payload };
+    return { kind: "ping", payload, channel: null };
   }
   if (command === "RECONNECT") return { kind: "reconnect" };
 
@@ -284,14 +284,21 @@ function parseIrcTags(raw: string): Record<string, string> {
 
 function decodeIrcTag(value: string): string {
   let output = "";
+  const escapes: Record<string, string> = {
+    s: " ",
+    ":": ";",
+    r: "\r",
+    n: "\n",
+    "\\": "\\",
+  };
   for (let index = 0; index < value.length; index += 1) {
-    const current = value[index];
+    const current = value.charAt(index);
     if (current !== "\\") {
       output += current;
       continue;
     }
-    const next = value[index += 1];
-    output += ({ s: " ", ":": ";", r: "\r", n: "\n", "\\": "\\" } as Record<string, string>)[next] ?? next ?? "";
+    const next = value.charAt(++index);
+    output += escapes[next] ?? next;
   }
   return output;
 }
@@ -307,5 +314,7 @@ function ircTimestamp(raw: string | undefined, now: () => number): string {
 }
 
 function bounded(value: string | undefined, max: number): string | null {
-  return typeof value === "string" && value.length > 0 && value.length <= max ? value : null;
+  return typeof value === "string" && value.length > 0 && value.length <= max
+    ? value
+    : null;
 }
