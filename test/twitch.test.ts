@@ -13,7 +13,6 @@ import {
   initializeRelayStorage,
   listComments,
   loadRelayState,
-  saveRelayState,
 } from "../src/relay-storage";
 import { createRunningState, createStoppedState } from "../src/types";
 import { nextRelayAlarm } from "../src/relay-schedule";
@@ -221,10 +220,12 @@ async function startConnected(relay: YouTubeChatRelay) {
   const started = await relay.startTwitch();
   expect(started.twitch.phase).toBe("waiting");
   const socket = FakeWebSocket.latest();
+  expect(socket.url).toBe("wss://irc-ws.chat.twitch.tv:443");
   socket.open();
-  expect(socket.sent).toEqual(
-    twitchIrcHandshake("azumagbanjo", expect.stringMatching(/^justinfan\d{5}$/) as unknown as string),
-  );
+  expect(socket.sent[0]).toBe("CAP REQ :twitch.tv/tags twitch.tv/commands");
+  expect(socket.sent[1]).toBe("PASS SCHMOOPIIE");
+  expect(socket.sent[2]).toMatch(/^NICK justinfan\d{5}$/);
+  expect(socket.sent[3]).toBe("JOIN #azumagbanjo");
   socket.message(":tmi.twitch.tv 001 guest :Welcome, GLHF!");
   expect((await relay.status()).twitch).toMatchObject({
     enabled: true,
