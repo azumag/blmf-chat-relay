@@ -40,13 +40,21 @@ JOIN #<channel>
 - `PING` → 即時 `PONG`
 - `RECONNECT` → WebSocket再接続
 
-`PRIVMSG` の `id`、`user-id`、`display-name`、`tmi-sent-ts` を利用します。公開JSON形式は従来どおり `name`, `message`, `created_at` の3項目です。内部コメントIDは `twitch:<channel>:<message-id>` です。
+`PRIVMSG` の `id`、`user-id`、`display-name`、`tmi-sent-ts` を利用します。公開JSON形式は従来どおり `name`, `message`, `created_at` の3項目です。
+
+内部コメントIDは `twitch:<source-namespace>:<message-id>` です。新規環境では `<source-namespace>` にchannel loginを使います。EventSub版から同一channelの既存runを引き継ぐ場合は、保存済みの数値 `broadcasterId` をnamespaceとして維持します。これによりデプロイ直後でも、IRCの `CLEARMSG` / `CLEARCHAT` がEventSub時代のコメントに引き続き作用します。
+
+## 接続成立判定
+
+WebSocket `open` やIRC `001 Welcome` だけでは接続完了扱いにしません。対象channelの `JOIN` / `ROOMSTATE`、または実際の `PRIVMSG` を受信して初めて管理画面の状態を `running` にします。
 
 ## 再接続
 
 WebSocketの `close` / `error` / Twitch `RECONNECT` を検出すると再接続します。一時的な失敗では1秒から最大30秒まで指数バックオフします。
 
 Cloudflare Durable ObjectsのWebSocket Hibernation APIはoutbound WebSocketには使えないため、Twitch開始中は通常のoutbound接続として維持します。DOが再生成・evictされた場合にも復帰できるよう、Twitch有効中は約60秒周期のAlarmを接続watchdogとして残します。
+
+Durable ObjectのAlarmは1本だけなので、IRC切断時に再接続時刻を直接上書きせず `reconnectAt` として永続化します。YouTube poll、R2 retry、Twitch flush、IRC reconnect、watchdogのうち最も早い時刻を共通Alarmへ設定します。
 
 このサービスは限定期間だけ利用する前提なので、長期常駐サービス向けのコスト最適化より、設定不要で確実に再接続できる単純な構成を優先しています。
 
