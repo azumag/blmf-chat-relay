@@ -3,6 +3,7 @@ import {
   createGuestNick,
   parseTwitchIrcFrame,
   twitchIrcHandshake,
+  twitchSourceNamespace,
   type TwitchDelivery,
   type TwitchEventType,
 } from "../src/twitch";
@@ -13,6 +14,7 @@ import {
   initializeRelayStorage,
   listComments,
   loadRelayState,
+  saveRelayState,
 } from "../src/relay-storage";
 import { createRunningState, createStoppedState } from "../src/types";
 import { nextRelayAlarm } from "../src/relay-schedule";
@@ -216,7 +218,14 @@ function delivery(
   };
 }
 
-async function startConnected(relay: YouTubeChatRelay) {
+function roomState(channel = "azumagbanjo") {
+  return `@room-id=1 :tmi.twitch.tv ROOMSTATE #${channel}\r\n`;
+}
+
+async function startConnected(
+  relay: YouTubeChatRelay,
+  flushWaits: () => Promise<void>,
+) {
   const started = await relay.startTwitch();
   expect(started.twitch.phase).toBe("waiting");
   const socket = FakeWebSocket.latest();
@@ -226,7 +235,18 @@ async function startConnected(relay: YouTubeChatRelay) {
   expect(socket.sent[1]).toBe("PASS SCHMOOPIIE");
   expect(socket.sent[2]).toMatch(/^NICK justinfan\d{5}$/);
   expect(socket.sent[3]).toBe("JOIN #azumagbanjo");
-  socket.message(":tmi.twitch.tv 001 guest :Welcome, GLHF!");
+
+  // Server welcome alone does not prove JOIN succeeded.
+  socket.message(":tmi.twitch.tv 001 guest :Welcome, GLHF!\r\n");
+  await flushWaits();
+  expect((await relay.status()).twitch).toMatchObject({
+    enabled: true,
+    phase: "waiting",
+    ready: false,
+  });
+
+  socket.message(roomState());
+  await flushWaits();
   expect((await relay.status()).twitch).toMatchObject({
     enabled: true,
     phase: "running",
@@ -264,6 +284,17 @@ describe("Twitch IRC parser", () => {
     });
   });
 
+  it("requires channel-specific activity to confirm JOIN", () => {
+    const [welcome] = parseTwitchIrcFrame(":tmi.twitch.tv 001 guest :Welcome\r\n");
+    const [room] = parseTwitchIrcFrame(roomState());
+    expect(welcome).toMatchObject({ kind: "activity", confirmsJoin: false });
+    expect(room).toMatchObject({
+      kind: "activity",
+      channel: "azumagbanjo",
+      confirmsJoin: true,
+    });
+  });
+
   it("maps CLEARMSG/CLEARCHAT and PING/RECONNECT", () => {
     const events = parseTwitchIrcFrame(
       [
@@ -291,12 +322,20 @@ describe("Twitch IRC parser", () => {
       delivery: { mutation: { kind: "clear" } },
     });
   });
+
+  it("preserves the legacy EventSub namespace for the same configured channel", () => {
+    const state = createStoppedState(time).twitch;
+    state.channel = "azumagbanjo";
+    state.broadcasterId = "123456";
+    expect(twitchSourceNamespace(state, "azumagbanjo")).toBe("123456");
+    expect(twitchSourceNamespace(state, "other_channel")).toBe("other_channel");
+  });
 });
 
 describe("anonymous IRC relay lifecycle", () => {
   it("connects without Twitch secrets, answers PING and enqueues IRC chat", async () => {
     const { relay, flushWaits } = fixture();
-    const socket = await startConnected(relay);
+    const socket = await startConnected(relay, flushWaits);
     socket.message("PING :tmi.twitch.tv\r\n");
     expect(socket.sent.at(-1)).toBe("PONG :tmi.twitch.tv");
     socket.message(
@@ -313,8 +352,8 @@ describe("anonymous IRC relay lifecycle", () => {
   });
 
   it("keeps the durable queue/R2 flush path and deduplicates duplicate IRC frames", async () => {
-    const { relay, objects, storage } = fixture();
-    await startConnected(relay);
+    const { relay, objects, storage, flushWaits } = fixture();
+    await startConnected(relay, flushWaits);
     const event = delivery("channel.chat.message", {
       id: "m1",
       mutation: {
@@ -337,9 +376,56 @@ describe("anonymous IRC relay lifecycle", () => {
     expect(await storage.getAlarm()).toBe(millis + 75_000);
   });
 
+  it("serializes JOIN state behind an in-flight R2 write", async () => {
+    const { relay, put, flushWaits } = fixture();
+    let release!: () => void;
+    let entered!: () => void;
+    const inR2 = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    put.mockImplementationOnce(async () => {
+      entered();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return {};
+    });
+
+    const start = relay.startTwitch();
+    await inR2;
+    const socket = FakeWebSocket.latest();
+    socket.open();
+    socket.message(roomState());
+
+    // The callback queued a serialized state transition; it must not write relay_state
+    // while startTwitch still owns the R2 operation.
+    release();
+    await start;
+    await flushWaits();
+    expect((await relay.status()).twitch.phase).toBe("running");
+  });
+
+  it("does not let reconnect scheduling delay an earlier YouTube alarm", async () => {
+    const { relay, storage, flushWaits } = fixture();
+    const socket = await startConnected(relay, flushWaits);
+    const state = loadRelayState(storage);
+    saveRelayState(storage, {
+      ...state,
+      enabled: true,
+      nextActionAt: new Date(millis + 500).toISOString(),
+    });
+
+    socket.error();
+    await flushWaits();
+    expect(loadRelayState(storage).twitch.reconnectAt).toBe(
+      new Date(millis + 1000).toISOString(),
+    );
+    expect(await storage.getAlarm()).toBe(millis + 500);
+  });
+
   it("reconnects after Twitch RECONNECT and remains enabled across YouTube stop", async () => {
     const { relay, flushWaits } = fixture();
-    const first = await startConnected(relay);
+    const first = await startConnected(relay, flushWaits);
     first.message(":tmi.twitch.tv RECONNECT\r\n");
     await flushWaits();
     expect((await relay.status()).twitch.phase).toBe("error");
@@ -348,15 +434,62 @@ describe("anonymous IRC relay lifecycle", () => {
     const second = FakeWebSocket.latest();
     second.open();
     second.message(":tmi.twitch.tv 001 guest :Welcome\r\n");
+    await flushWaits();
+    expect((await relay.status()).twitch.phase).toBe("waiting");
+    second.message(roomState());
+    await flushWaits();
     expect((await relay.status()).twitch.phase).toBe("running");
     await relay.start("@example");
     await relay.stop();
     expect((await relay.status()).twitch.enabled).toBe(true);
   });
 
+  it("keeps the legacy numeric namespace so IRC moderation reaches existing comments", async () => {
+    const { relay, storage, flushWaits } = fixture();
+    const state = loadRelayState(storage);
+    const legacy: TwitchDelivery = {
+      ...delivery("channel.chat.message"),
+      id: "legacy-message",
+      broadcasterId: "123456",
+      mutation: {
+        kind: "message",
+        id: "legacy-message",
+        authorId: "legacy-viewer",
+        name: "legacy viewer",
+        message: "legacy EventSub comment",
+      },
+    };
+    applyTwitchDelivery(storage, state.runId, legacy);
+    saveRelayState(storage, {
+      ...state,
+      twitch: {
+        ...state.twitch,
+        enabled: true,
+        channel: "azumagbanjo",
+        broadcasterId: "123456",
+        phase: "running",
+        startedAt: time,
+      },
+    });
+
+    await relay.startTwitch();
+    const socket = FakeWebSocket.latest();
+    socket.open();
+    socket.message(roomState());
+    await flushWaits();
+    expect((await relay.status()).twitch.broadcasterId).toBe("123456");
+
+    socket.message(
+      `@target-msg-id=legacy-message;tmi-sent-ts=${millis + 1000} :tmi.twitch.tv CLEARMSG #azumagbanjo :old\r\n`,
+    );
+    await flushWaits();
+    await relay.commentsDeltaSimple(50);
+    expect(listComments(storage, state.runId)).toEqual([]);
+  });
+
   it("stops the socket and ignores queued events from before the next start", async () => {
-    const { relay } = fixture();
-    const socket = await startConnected(relay);
+    const { relay, flushWaits } = fixture();
+    const socket = await startConnected(relay, flushWaits);
     const old = delivery();
     await relay.stopTwitch();
     expect(socket.readyState).toBe(3);
