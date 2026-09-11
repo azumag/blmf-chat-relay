@@ -2,9 +2,9 @@
 
 ## 1. 目的
 
-YouTube の配信IDを運用者が都度調べることなく、チャンネル指定だけで現在のライブ配信を発見し、コメントの最新スナップショットを Cloudflare R2 へ公開する。
+YouTube と Twitch のライブチャットを1つのコメントフィードへ集約し、Cloudflare R2 の `comments.json` と差分APIから利用できるようにする。
 
-運用条件は「配信中だけ使う」ことを前提とし、開始・停止が簡単で、停止中には YouTube API を呼ばないことを重視する。
+運用条件はイベント等の**限定期間だけ利用する**ことを前提とする。YouTube と Twitch は個別に開始・停止でき、長期常駐サービス向けの複雑な認証基盤より、短期間の運用を簡単に開始できることを優先する。
 
 ## 2. コンポーネント
 
@@ -13,10 +13,13 @@ YouTube の配信IDを運用者が都度調べることなく、チャンネル�
 責務:
 
 - 管理画面、CSS、JavaScriptの配信
-- 開始・停止・状態取得 API
+- YouTube / Twitch の開始・停止・状態取得 API
 - Bearer トークン認証
 - 単一 Durable Object への RPC
+- 差分APIの公開
 - セキュリティヘッダーと構造化エラーログ
+
+旧 `/api/twitch/eventsub` は存在しない。Twitchからのpublic webhook callbackは受けない。
 
 ### Durable Object `YouTubeChatRelay`
 
@@ -24,25 +27,32 @@ YouTube の配信IDを運用者が都度調べることなく、チャンネル�
 
 - リレー状態の永続化
 - YouTube API 呼び出しのスケジューリング
-- コメントの重複排除
+- Twitch IRC WebSocket の接続・再接続
+- Twitch IRCイベントの永続キュー化
+- コメントの重複排除・削除反映
 - R2 スナップショットの生成
 - 配信終了・エラー・手動停止の状態遷移
 
-YouTube の開始・停止・discovery・ポーリングはインスタンス内の Promise チェーンで直列化する。YouTube や R2 の外部 I/O 中に開始・停止処理が割り込んで、古い実行が新しい `comments.json` を上書きする競合を避けるためである。Twitch の EventSub 通知はこの直列化の外で永続キューに即時 ACK し、直列化されたキューへの反映を Alarm 経由で後追いする（詳細は `docs/twitch.md` を参照）。
+YouTube の開始・停止・discovery・polling、R2 write、Twitchの接続状態変更はインスタンス内の Promise チェーン `runSerially()` で直列化する。外部 I/O 中に別処理が `relay_state` を古い値で上書きしないためである。
+
+Twitch IRC socket callbackで例外的に直列化の外で行うのは、状態を書き換えない `PING -> PONG` と、受信イベントを `twitch_pending` にdurable enqueueする処理だけである。JOIN確認・NOTICE・切断・再接続状態の保存は必ず `runSerially()` へ投入する。
 
 ### R2
 
-- `comments.json`: 現在または最後に停止した配信のコメント配列
+- `comments.json`: 現在または最後に停止したrunのコメント配列
 - `status.json`: 公開状態
-- `streams/{videoId}/comments.json`: 配信別スナップショット
+- `streams/{videoId}/comments.json`: YouTubeを含むrunの配信別スナップショット
+- `streams/twitch-{channel}/{runId}/comments.json`: Twitch単独runのアーカイブ
 
-R2 へは Worker 内から REST API を呼ばず、R2 binding を使用する。
+R2へはWorker内からREST APIを呼ばず、R2 bindingを使用する。
 
 ## 3. 状態
 
+### YouTube
+
 | phase | 意味 |
 |---|---|
-| `stopped` | 無効。Alarmなし、YouTube API呼び出しなし |
+| `stopped` | 無効。YouTube API呼び出しなし |
 | `discovering` | チャンネル解決またはライブ配信検索中 |
 | `waiting` | ライブ未検出。低頻度の再検索待ち |
 | `running` | ライブチャット取得中 |
@@ -58,9 +68,26 @@ R2 へは Worker 内から REST API を呼ばず、R2 binding を使用する。
 - `startedAt`, `lastPollAt`, `lastFlushAt`, `nextActionAt`
 - `lastError`, `consecutiveErrors`
 
-`runId` は開始単位で生成し、コメントテーブルのパーティションキーとして使う。前回の配信データと新しい開始処理を混同しない。
+### Twitch
+
+`relay_state.twitch` に以下を保持する。
+
+- `enabled`
+- `channel`
+- `broadcasterId`: コメントID用source namespace
+- `phase`: `stopped | waiting | running | error`
+- `startedAt`, `lastReceivedAt`, `lastError`
+- `flushAt`
+- `reconnectAt`
+- `subscriptions`: EventSub時代との状態互換用。IRC接続成立時は内部的に `irc` を入れて `ready` 表示を作る
+
+`broadcasterId` は名称上は旧EventSub由来だが、現在は**Twitchコメントの永続namespace**として使う。EventSubからIRCへin-place移行する際、同一channelに既存の数値broadcaster idが保存されていればその値を継承する。これにより既存runの `twitch:<numeric-id>:...` コメントへIRCの `CLEARMSG/CLEARCHAT` を継続適用できる。新規環境ではchannel loginをnamespaceに使う。
+
+`runId` はコメントテーブルのパーティションキーであり、無関係な配信のコメントを混同しないために使う。
 
 ## 4. SQLite スキーマ
+
+主要テーブル:
 
 ```sql
 CREATE TABLE relay_state (
@@ -77,11 +104,43 @@ CREATE TABLE comments (
   created_at TEXT NOT NULL,
   PRIMARY KEY (run_id, id)
 );
+
+CREATE TABLE comment_events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('upsert', 'delete')),
+  comment_id TEXT NOT NULL,
+  name TEXT,
+  message TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE twitch_pending (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  delivery TEXT NOT NULL
+);
+
+CREATE TABLE twitch_receipts (
+  id TEXT PRIMARY KEY,
+  received_at INTEGER NOT NULL
+);
+
+CREATE TABLE twitch_moderation (
+  run_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  target TEXT NOT NULL,
+  deleted_at TEXT NOT NULL,
+  PRIMARY KEY (run_id, kind, target)
+);
 ```
 
-YouTube のメッセージIDを使って `UPSERT` し、同じページを再取得しても重複しない。
+`twitch_pending` はtransport-neutralなTwitchイベントキューとして使う。IRC frameを正規化した後、YouTube/R2の外部I/Oを待たずここへ保存する。
 
-## 5. チャンネルからライブチャットまでの解決
+`twitch_receipts` は同一イベントの二重適用防止に使う。IRCの `PRIVMSG` ではTwitch message idが安定したdedupe keyになる。
+
+`twitch_moderation` は削除がメッセージより先に届いた場合でも後着メッセージを復活させないために使う。
+
+## 5. YouTube: チャンネルからライブチャットまで
 
 1. `channels.list`
    - チャンネルIDなら `id`
@@ -93,29 +152,77 @@ YouTube のメッセージIDを使って `UPSERT` し、同じページを再取
    - `type=video`
 3. `videos.list`
    - `part=snippet,liveStreamingDetails`
-   - `activeLiveChatId` がある、終了していない動画を選ぶ
+   - `activeLiveChatId` があり、終了していない動画を選ぶ
 4. `liveChatMessages.list`
    - `part=id,snippet,authorDetails`
-   - `nextPageToken` を次回へ保存
-   - `pollingIntervalMillis` に従って次回 Alarm を設定
+   - `nextPageToken` を保存
+   - `pollingIntervalMillis` に従って次回処理時刻を保存
 
 同時に複数のライブが見つかった場合は、`actualStartTime` が最も新しいものを採用する。
 
 ### 限定公開E2E専用経路
 
-`POST /api/e2e/start` は管理トークンに加えてチャンネルと既知の11文字の動画IDを受け取る。`search.list` は使わず、次の順に検証してから同じコメント取得処理へ接続する。
+`POST /api/e2e/start` は管理トークンに加えてチャンネルと既知の11文字の動画IDを受け取る。`search.list` は使わず、次の順に検証する。
 
-1. 通常経路と同じ方法で指定チャンネルを解決する
-2. `videos.list(id=<videoId>)` で動画を直接取得する
-3. 動画の `snippet.channelId` が解決済みチャンネルIDと一致することを確認する
-4. `actualStartTime` があり、`actualEndTime` がなく、`activeLiveChatId` があることを確認する
-5. Durable Object を `running` で開始し、即時 Alarm から通常の `liveChatMessages.list` へ進む
+1. 通常経路と同じ方法で指定チャンネルを解決
+2. `videos.list(id=<videoId>)` で動画を直接取得
+3. `snippet.channelId` が解決済みチャンネルIDと一致することを確認
+4. `actualStartTime` があり、`actualEndTime` がなく、`activeLiveChatId` があることを確認
+5. 同じpolling処理へ接続
 
-この経路は限定公開動画を検索結果へ露出させずに実配信E2Eを行うためのもので、通常の `/api/start` の自動検出動作は変更しない。動画の公開範囲やYouTubeの通知設定を変更する機能は持たない。
+## 6. Twitch: 匿名IRC
 
-## 6. コメント変換
+`POST /api/twitch/start` でDOが次へ接続する。
 
-R2へ出す公開形式は次の3項目だけとする。
+```text
+wss://irc-ws.chat.twitch.tv:443
+```
+
+接続後:
+
+```text
+CAP REQ :twitch.tv/tags twitch.tv/commands
+PASS SCHMOOPIIE
+NICK justinfan#####
+JOIN #<channel>
+```
+
+OAuth、Client ID、EventSub subscription、Webhook secretは使用しない。
+
+### 接続成立判定
+
+WebSocket `open` や IRC `001 Welcome` だけでは `running` にしない。これらはIRCセッション成立しか証明しないためである。
+
+次のいずれかを対象channelで受けた時点で `running` / `ready` とする。
+
+- `JOIN`
+- `ROOMSTATE`
+- `PRIVMSG`
+
+### IRCイベント変換
+
+- `PRIVMSG` -> `message`
+- `CLEARMSG` -> `delete`
+- `CLEARCHAT` + `target-user-id` -> `clear-user`
+- `CLEARCHAT` without target -> `clear`
+- `PING` -> 即時 `PONG`
+- `RECONNECT` -> socket切断 + `reconnectAt` 設定
+
+`PRIVMSG` の `tmi-sent-ts` を `created_at` に使う。
+
+### socket callbackと直列化
+
+socket callbackから `relay_state` を直接 `load -> save` してはいけない。R2やYouTube APIをawait中にcallbackが保存すると、外部I/O完了後の古いstate保存で状態を巻き戻す競合が発生するためである。
+
+- `PONG`: stateを書かないため同期送信
+- message: `twitch_pending` へ即時enqueue
+- JOIN/ROOMSTATE/NOTICE/close/error/RECONNECT: `runSerially()` へ状態変更を投入
+
+古いsocket callbackが新しいsocketの状態を壊さないよう、インメモリのgenerationを照合する。
+
+## 7. コメント変換
+
+R2へ出す公開形式は3項目のみ。
 
 ```ts
 interface ExportedComment {
@@ -125,34 +232,41 @@ interface ExportedComment {
 }
 ```
 
-内部では重複排除とモデレーション反映のため、YouTube のメッセージIDと投稿者チャンネルIDも保持する。
+内部では重複排除・削除反映のためmessage idとauthor idも保持する。
 
-変換規則:
+Twitch内部IDは次の形式。
 
-- `hasDisplayContent` があり、表示名・本文・投稿時刻が揃うイベントを保存
-- `tombstone` または削除イベントは対象メッセージを削除
-- `userBannedEvent` は対象投稿者の当該配信内コメントを削除
-- `chatEndedEvent` または `offlineAt` を受けたら最終保存して自動停止
-- 表示内容のないモード変更イベント等は無視
+```text
+twitch:<source-namespace>:<message-id>
+```
 
-## 7. スケジューリング
+削除イベントはYouTubeコメントには影響しない。
 
-Durable Object の Alarm は1個だけ設定できるため、状態に応じて次のどちらかを予約する。
+## 8. スケジューリング
 
-- `waiting`: `DISCOVERY_INTERVAL_SECONDS` 後に配信再検索
-- `running`: YouTube 応答の `pollingIntervalMillis` 後にコメント再取得
+Durable Object Alarmは1個しか持てない。個別処理が自由に `setAlarm()` して最後に書いたdeadlineで上書きする設計にはしない。
 
-開始時は `Date.now()` で即時 Alarm を設定する。停止時は Alarm を削除する。
+`nextRelayAlarm()` が次の候補の**最小時刻**を選ぶ。
 
-## 8. R2 書き込み
+- YouTube discovery/poll: `nextActionAt`
+- Twitch snapshot flush: `twitch.flushAt`
+- Twitch reconnect: `twitch.reconnectAt`
+- Twitch接続watchdog: Twitch有効中は約60秒後
+- 停止後R2 retry: `nextActionAt`
+
+Twitch切断callbackは `reconnectAt` をstateへ保存するだけで、直接 `setAlarm(reconnectAt)` しない。`runSerially()` のfinallyで全候補を再評価するため、例えば500ms後のYouTube pollがある状態で1秒後のIRC reconnectが発生しても、Alarmは500msを維持する。
+
+`twitch_pending` enqueueだけは処理遅延を避けるため即時Alarmをarmしてよい。これは既存deadlineを**早めるだけ**であり、queue drain後に再度最小deadlineへ収束する。
+
+## 9. R2 書き込み
 
 通常は `R2_FLUSH_INTERVAL_SECONDS` ごとに以下を書き込む。
 
 1. 最新 `comments.json`
-2. `videoId` がある場合は配信別アーカイブ
-3. 上記が成功した後に `status.json`
+2. 配信別またはTwitch単独archive
+3. 上記成功後に `status.json`
 
-コメント本体と配信別アーカイブは並列化し、状態JSONは最後に書く。これにより `status.json` が成功を示しているのにコメント本体だけが古い、という部分成功を避ける。
+コメント本体とarchiveは並列化し、statusは最後に書く。部分成功でstatusだけ新しくなる状態を避ける。
 
 次の場合は間隔を待たず強制反映する。
 
@@ -163,11 +277,11 @@ Durable Object の Alarm は1個だけ設定できるため、状態に応じて
 - 配信終了
 - エラー状態へ遷移
 
-`Cache-Control: no-store, max-age=0, must-revalidate` を設定し、R2カスタムドメイン側で古い JSON が残りにくいようにする。
+`Cache-Control: no-store, max-age=0, must-revalidate` を設定する。
 
-## 9. エラー処理
+## 10. エラー処理
 
-### 自動停止するエラー
+### YouTube: 自動停止
 
 - APIキー不正
 - YouTube Data API 未有効
@@ -176,7 +290,7 @@ Durable Object の Alarm は1個だけ設定できるため、状態に応じて
 - ライブチャット無効
 - チャンネル不正
 
-### 再試行するエラー
+### YouTube: 再試行
 
 - ネットワークエラー
 - YouTube 5xx
@@ -185,45 +299,55 @@ Durable Object の Alarm は1個だけ設定できるため、状態に応じて
 
 2秒から最大5分まで指数バックオフする。
 
-### 特別処理
+### Twitch
 
-- `pageTokenInvalid`: ページトークンを破棄し、2秒後に最新ページから再開
-- `liveChatEnded` / `liveChatNotFound`: 配信終了扱いで最終保存して停止
-- R2書き込み失敗: コメント取得中は次回ポーリング時に再試行する。停止後の最終反映失敗は、YouTube APIを呼ばないR2専用Alarmを30秒後に設定して再試行する
+WebSocket `error` / `close` は1秒から最大30秒の指数バックオフで再接続する。Twitch `RECONNECT` は即時再接続deadlineを設定する。
 
-## 10. セキュリティ
+DOがevict/recreateされた場合は永続 `twitch.enabled` とAlarm watchdogからsocketを再作成する。outbound WebSocketはWebSocket Hibernation APIの対象ではないため、Twitch開始中は通常のoutbound接続として動作する。
 
-- `YOUTUBE_API_KEY` と `ADMIN_TOKEN` は Secret
-- 開始・停止は Bearer 認証
-- 限定公開E2E開始も同じ Bearer 認証を必須とし、対象チャンネルとの一致を検証
-- トークン比較は Web Crypto の HMAC verify を使用
-- 状態取得は公開。公開R2に含まれる情報と同等のため
-- 管理画面は厳格な CSP を設定し、外部スクリプトを読み込まない
+### R2
+
+停止後の最終反映失敗は30秒後をretry deadlineとしてstateへ保存し、共有Alarmの最小deadline選択へ入れる。
+
+## 11. セキュリティ
+
+- `YOUTUBE_API_KEY` と `ADMIN_TOKEN` はSecret
+- Twitch用Secret/OAuth tokenは持たない
+- 開始・停止はBearer認証
+- 限定公開E2E開始もBearer認証し、対象YouTubeチャンネルとの一致を検証
+- 管理トークン比較はWeb Cryptoを使用
+- 状態取得は公開R2相当の情報のみ
+- 管理画面は厳格なCSPを設定し、外部スクリプトを読み込まない
 - APIレスポンスと管理画面は `no-store`
 - ログに管理トークン、APIキー、コメント本文、視聴者名を出さない
 
-管理面を独自ドメインに割り当てる場合は Cloudflare Access を追加する。
+管理面を独自ドメインに割り当てる場合はCloudflare Accessを追加する。
 
-## 11. 整合性
+## 12. 整合性
 
-外部 I/O を含む操作を直列化し、停止・再開始・Alarm の同時実行を防ぐ。さらに `runId` を各処理で検証し、古い実行単位の結果を現在状態へ適用しない。
+- 外部I/Oを含む状態変更は `runSerially()` で直列化する
+- Twitchコメント本体は先にdurable queueへ保存し、後から同じ直列処理へ合流する
+- socket generationでstale callbackを無視する
+- `runId` で古い配信単位の結果を現在stateへ適用しない
+- Alarmは全deadlineの最小値に一本化する
+- R2書き込みは完全なsnapshotで冪等に収束させる
+- EventSub -> IRC移行時は同一channelの旧source namespaceを継承する
 
-R2 書き込みは冪等で、同じオブジェクトへ完全なスナップショットを書き直す。途中失敗した場合も次回の完全書き込みで収束する。
-
-## 12. 制約と将来案
+## 13. 制約と将来案
 
 ### 現行制約
 
-- リレー開始以前のチャット全履歴を保証しない
+- リレー開始以前の全チャット履歴を保証しない
+- Twitch IRCは接続中に受信したイベントのみ対象
+- Twitch有効中のoutbound WebSocketはDO Hibernation対象外
 - 単一JSON配列のため、高コメント量ではR2転送量が増える
-- YouTube の検索専用クォータを使うため、配信待機の常時稼働を想定しない
-- 単一チャンネル・単一同時配信を対象とする
+- YouTubeの検索クォータを使うため、配信待機の常時稼働を想定しない
+- 単一Twitchチャンネル・単一YouTube同時配信を対象とする
 
 ### 将来案
 
-- `liveChatMessages.streamList` を利用したストリーミング取得の検証
-- `comments.json` 互換出力を維持しつつ、内部をチャンク化
-- 複数チャンネル対応（チャンネルごとに Durable Object を分割）
-- Cloudflare Access 前提の管理ドメイン
-- GitHub Actions によるデプロイ
-- R2ライフサイクルルールによる古い配信アーカイブ整理
+- `liveChatMessages.streamList` の検証
+- `comments.json` 互換出力を維持した内部チャンク化
+- 複数チャンネル対応（チャンネルごとにDurable Objectを分割）
+- Cloudflare Access前提の管理ドメイン
+- R2ライフサイクルルールによる古いarchive整理
