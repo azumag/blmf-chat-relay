@@ -1,5 +1,6 @@
 import { ADMIN_CSS, ADMIN_HTML, ADMIN_SCRIPT } from "./admin";
 import { isAuthorized } from "./auth";
+import { readTwitchDelivery, twitchConfig, TwitchRequestError } from "./twitch";
 
 export { YouTubeChatRelay } from "./relay";
 
@@ -15,6 +16,28 @@ export default {
     const url = new URL(request.url);
 
     try {
+      if (url.pathname === "/api/twitch/eventsub") {
+        if (request.method !== "POST") {
+          return new Response(null, { status: 405, headers: secureHeaders({ Allow: "POST" }) });
+        }
+        const delivery = await readTwitchDelivery(request, env);
+        await env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME).receiveTwitch(delivery);
+        return delivery.challenge === null ? new Response(null, { status: 204, headers: secureHeaders({}) }) :
+          new Response(delivery.challenge, { headers: secureHeaders({ "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": String(new TextEncoder().encode(delivery.challenge).length), "Cache-Control": "no-store" }) });
+      }
+
+      if (request.method === "POST" && (url.pathname === "/api/twitch/start" || url.pathname === "/api/twitch/stop")) {
+        const unauthorized = await requireAuthorization(request, env);
+        if (unauthorized !== null) return unauthorized;
+        const isStart = url.pathname.endsWith("/start");
+        // Validate here, not just inside the Durable Object: thrown errors crossing the
+        // RPC boundary lose their prototype chain, so `instanceof TwitchRequestError`
+        // below would not match an error thrown by relay.startTwitch() itself.
+        if (isStart) twitchConfig(env);
+        const relay = env.CHAT_RELAY.getByName(RELAY_OBJECT_NAME);
+        return jsonResponse(isStart ? await relay.startTwitch() : await relay.stopTwitch());
+      }
       if (request.method === "GET" && url.pathname === "/") {
         return Response.redirect(new URL("/admin", url).toString(), 302);
       }
@@ -167,6 +190,7 @@ export default {
 
       return errorResponse("Not Found", 404);
     } catch (error) {
+      if (error instanceof TwitchRequestError) return errorResponse(error.message, error.status);
       console.error(
         JSON.stringify({
           level: "error",

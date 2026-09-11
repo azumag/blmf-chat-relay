@@ -13,6 +13,7 @@ import {
   normalizeDateTime,
   type LiveChatMessageItem,
 } from "./youtube";
+import type { TwitchDelivery } from "./twitch";
 
 interface StateRow {
   [key: string]: SqlStorageValue;
@@ -86,6 +87,23 @@ export function initializeRelayStorage(storage: DurableObjectStorage): void {
 
     CREATE INDEX IF NOT EXISTS comment_events_run_seq
       ON comment_events (run_id, seq);
+
+    CREATE TABLE IF NOT EXISTS twitch_receipts (
+      id TEXT PRIMARY KEY,
+      received_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS twitch_receipts_time ON twitch_receipts(received_at);
+    CREATE TABLE IF NOT EXISTS twitch_pending (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      delivery TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS twitch_moderation (
+      run_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      target TEXT NOT NULL,
+      deleted_at TEXT NOT NULL,
+      PRIMARY KEY (run_id, kind, target)
+    );
   `);
 
   const existing = storage.sql
@@ -362,6 +380,73 @@ export function deleteRunEvents(
   runId: string,
 ): void {
   storage.sql.exec("DELETE FROM comment_events WHERE run_id = ?", runId);
+  storage.sql.exec("DELETE FROM twitch_moderation WHERE run_id = ?", runId);
+}
+
+// A retry gets a fresh Twitch-Eventsub-Message-Timestamp (see the comment in
+// applyTwitchDelivery below), so readTwitchDelivery's 10-minute freshness check bounds
+// each individual attempt's own latency, not how long the overall retry sequence can
+// run — that's undocumented by Twitch. Community-observed behavior is a handful of
+// attempts over a couple of minutes, but this window is kept an order of magnitude
+// larger than that (rather than matching the 10-minute freshness check) since an
+// under-sized window fails destructively: an id purged too early and then retried is
+// reprocessed, which is idempotent for a chat message but not for a clear (its
+// deleted_at only ever moves forward, permanently re-suppressing anything in between).
+const RECEIPT_RETENTION_MS = 3_600_000;
+
+/** Must run in the same transaction as the durable enqueue and alarm writes. */
+export function acceptTwitchDelivery(storage: DurableObjectStorage, id: string): boolean {
+  const now = Date.now();
+  storage.sql.exec("DELETE FROM twitch_receipts WHERE received_at < ?", now - RECEIPT_RETENTION_MS);
+  if (storage.sql.exec("SELECT id FROM twitch_receipts WHERE id = ?", id).toArray().length) return false;
+  storage.sql.exec("INSERT INTO twitch_receipts (id, received_at) VALUES (?, ?)", id, now);
+  return true;
+}
+
+export function applyTwitchDelivery(storage: DurableObjectStorage, runId: string, delivery: TwitchDelivery): void {
+  const mutation = delivery.mutation;
+  if (!mutation) return;
+  const prefix = `twitch:${delivery.broadcasterId}:`;
+  const timestamp = delivery.timestamp;
+  if (mutation.kind === "message") {
+    // A delete may arrive before its message; receipts alone cannot prevent resurrection.
+    // Known gap: `timestamp` is the EventSub delivery's own header timestamp, not a
+    // message-origin time (channel.chat.message carries no such field). A message whose
+    // first delivery attempt fails and is retried gets a fresh, later timestamp on
+    // success, so a clear that lands in the retry gap may not block it. Twitch-Eventsub-
+    // Message-Retry (not currently read) would say "this is a retry" but still can't
+    // recover the true origin time, so it can't fix the check itself; see docs/twitch.md
+    // for the operator remedy (a targeted message_delete permanently suppresses by id,
+    // with no timestamp condition).
+    const blocked = storage.sql.exec(
+      `SELECT target FROM twitch_moderation WHERE run_id = ? AND
+       ((kind = 'delete' AND target = ?) OR (deleted_at >= ? AND
+       ((kind = 'clear-user' AND target = ?) OR (kind = 'clear' AND target = ?))))`,
+      runId, prefix + mutation.id, timestamp, prefix + mutation.authorId, prefix,
+    ).toArray().length > 0;
+    const id = prefix + mutation.id;
+    if (blocked || findStoredComment(storage, runId, id)) return;
+    applyChatItems(storage, runId, [{
+      id,
+      snippet: { publishedAt: timestamp, displayMessage: mutation.message },
+      authorDetails: { channelId: prefix + mutation.authorId, displayName: mutation.name },
+    }]);
+    return;
+  }
+  const target = prefix + (mutation.kind === "delete" ? mutation.id : mutation.kind === "clear-user" ? mutation.authorId : "");
+  storage.sql.exec(
+    `INSERT INTO twitch_moderation (run_id, kind, target, deleted_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (run_id, kind, target) DO UPDATE SET deleted_at = MAX(deleted_at, excluded.deleted_at)`,
+    runId, mutation.kind, target, timestamp,
+  );
+  const selection = mutation.kind === "delete" ? "id = ?" :
+    mutation.kind === "clear-user" ? "author_channel_id = ? AND created_at <= ?" : "substr(id, 1, ?) = ? AND created_at <= ?";
+  const bindings: SqlStorageValue[] = mutation.kind === "delete" ? [target] :
+    mutation.kind === "clear-user" ? [target, timestamp] : [prefix.length, prefix, timestamp];
+  const rows = storage.sql.exec<{ id: string }>(`SELECT id FROM comments WHERE run_id = ? AND ${selection}`, runId, ...bindings).toArray();
+  for (const row of rows) {
+    applyChatItems(storage, runId, [{ id: row.id, snippet: { type: "tombstone", publishedAt: timestamp } }]);
+  }
 }
 
 export function loadRelayState(

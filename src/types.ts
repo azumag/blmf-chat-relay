@@ -1,3 +1,5 @@
+import { createTwitchState, TWITCH_EVENT_TYPES, type TwitchState } from "./twitch";
+
 export type RelayPhase =
   | "stopped"
   | "discovering"
@@ -6,6 +8,7 @@ export type RelayPhase =
   | "error";
 
 export interface RelayState {
+  twitch: TwitchState;
   version: 1;
   enabled: boolean;
   runId: string;
@@ -15,6 +18,13 @@ export interface RelayState {
   channelTitle: string | null;
   videoId: string | null;
   videoTitle: string | null;
+  // Twitch channel this run archives under (mirrors videoId's lifecycle): set
+  // when Twitch starts contributing to this run, left untouched by stopTwitch
+  // so the final flush still archives correctly, and reset to null only when
+  // a genuinely new, unrelated run is created. Deliberately NOT read from the
+  // long-lived twitch.channel field, which stopTwitch never clears and which
+  // otherwise leaks into an unrelated later run's archive path.
+  archiveChannel: string | null;
   liveChatId: string | null;
   nextPageToken: string | null;
   startedAt: string | null;
@@ -69,6 +79,7 @@ export interface SimpleCommentDeltaResponse {
 }
 
 export interface RelayStatus {
+  twitch: Omit<TwitchState, "flushAt" | "subscriptions"> & { ready: boolean };
   enabled: boolean;
   phase: RelayPhase;
   channel: {
@@ -119,6 +130,7 @@ export interface RelayConfig {
 
 export function createStoppedState(now = new Date().toISOString()): RelayState {
   return {
+    twitch: createTwitchState(),
     version: 1,
     enabled: false,
     runId: crypto.randomUUID(),
@@ -128,6 +140,7 @@ export function createStoppedState(now = new Date().toISOString()): RelayState {
     channelTitle: null,
     videoId: null,
     videoTitle: null,
+    archiveChannel: null,
     liveChatId: null,
     nextPageToken: null,
     startedAt: null,
@@ -195,7 +208,8 @@ export function buildPublicUrl(baseUrl: string, objectKey: string): string {
 
 export function archiveObjectKey(state: RelayState): string | null {
   if (state.videoId === null) {
-    return null;
+    return state.archiveChannel === null ? null :
+      `streams/twitch-${encodeURIComponent(state.archiveChannel)}/${encodeURIComponent(state.runId)}/comments.json`;
   }
 
   return `streams/${encodeURIComponent(state.videoId)}/comments.json`;
@@ -233,6 +247,16 @@ export function toRelayStatus(
   const archiveKey = archiveObjectKey(state);
 
   return {
+    twitch: {
+      enabled: state.twitch.enabled,
+      channel: state.twitch.channel,
+      broadcasterId: state.twitch.broadcasterId,
+      phase: state.twitch.phase,
+      startedAt: state.twitch.startedAt,
+      lastReceivedAt: state.twitch.lastReceivedAt,
+      lastError: state.twitch.lastError,
+      ready: TWITCH_EVENT_TYPES.every((type) => state.twitch.subscriptions[type] !== undefined),
+    },
     enabled: state.enabled,
     phase: state.phase,
     channel: {
