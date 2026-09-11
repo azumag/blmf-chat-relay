@@ -90,6 +90,14 @@ export function twitchConfig(env: Env) {
   return { channel, url: TWITCH_IRC_URL };
 }
 
+export function shouldAttemptTwitchReconnect(
+  state: TwitchState,
+  now = Date.now(),
+): boolean {
+  const reconnectAt = Date.parse(state.reconnectAt ?? "");
+  return !Number.isFinite(reconnectAt) || reconnectAt <= now;
+}
+
 export function createGuestNick(random: () => number = Math.random): string {
   return `justinfan${Math.floor(10_000 + random() * 90_000)}`;
 }
