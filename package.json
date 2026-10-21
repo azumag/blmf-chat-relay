@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Cloudflare Workers relay that discovers the active YouTube livestream for a channel and publishes chat snapshots to R2.",
   "engines": {
-    "node": ">=22"
+    "node": "^22.23.4 || ^24.22.1 || ^26.12.1"
   },
   "scripts": {
     "dev": "wrangler dev",
@@ -19,9 +19,9 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "miniflare": "5.20260820.0-alpha",
+    "miniflare": "5.20261019.1-beta",
     "typescript": "7.0.2",
-    "vitest": "4.1.11",
-    "wrangler": "4.125.0"
+    "vitest": "4.1.12",
+    "wrangler": "4.151.3"
   }
 }

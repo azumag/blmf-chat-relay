@@ -108,7 +108,7 @@ YouTubeが停止してもTwitchは個別に停止するまで継続します。
 
 ### 必要なもの
 
-- Node.js 22以上
+- `.node-version` に固定した Node.js 22.23.4（CIも同じバージョンを使用）
 - Cloudflareアカウント
 - R2
 - YouTube Data API v3を有効化したGoogle Cloudプロジェクト
@@ -119,7 +119,7 @@ Twitch DeveloperアプリやTwitch OAuth設定は不要です。
 ### 依存関係
 
 ```bash
-npm install
+npm ci --ignore-scripts
 ```
 
 ### R2バケット
